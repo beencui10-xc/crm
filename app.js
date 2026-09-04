@@ -1,12 +1,10 @@
 /* ============================================================
-   Customer Follow-up Management System — Web Edition
-   Pure client-side. Replicates image_HSI... no, replicates
-   Customers_follow-up_management_system_Va.py functionality.
-   Data model mirrors the Excel layout:
-     Sheet1 = customer master (one row per customer)
-     Contacts = serialized string with <Key:Value> tags, one block per contact
-     config = rating offsets + dropdown option lists
-   Storage: in-memory + localStorage backup. Import/export via SheetJS.
+   Customer Follow-up Management System — Web Edition V4
+   Changes from V3:
+   1. Working folder setting for auto-save
+   2. Auto-save every 30 minutes (instead of 1 hour)
+   3. Delete previous auto-save file after saving new one
+   4. Multi-cloud support: Local / Google Drive / OneDrive
    ============================================================ */
 
 (function () {
@@ -31,17 +29,569 @@
     contactStatusList: ["Active", "Bounce", "Deactivated", "Removed"],
   };
 
-  const STORAGE_KEY = "cfms_data_v1";
-  const CONFIG_KEY = "cfms_config_v1";
+  const STORAGE_KEY = "cfms_data_v4";
+  const CONFIG_KEY = "cfms_config_v4";
+
+  /* V4 — IndexedDB persistence */
+  const IDB_NAME = "cfms_db_v4";
+  const IDB_STORE = "kv";
+  let idb = null;
+
+  /* V4 — Working folder auto-save */
+  let workingDirHandle = null;
+  const AUTO_SAVE_FILE = "客户总表_自动保存.xlsx";
+  const AUTO_SAVE_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
+  let autoSaveTimer = null;
+  let lastAutoSaveTime = "";
+  let currentAutoSaveFileName = ""; // Track current file to delete on next save
+  const WORKING_DIR_HANDLE_KEY = "workingDirHandle";
+  const LAST_SAVE_NAME_KEY = "lastAutoSaveName";
+
+  /* ============================================================
+     V4 — Cloud Storage Configuration
+     ============================================================ */
+  const CLOUD_STORAGE_KEY = "cfms_cloud_storage_v4";
+  const GOOGLE_DRIVE_TOKEN_KEY = "google_drive_token";
+  const ONEDRIVE_TOKEN_KEY = "onedrive_token";
+  const GOOGLE_CONFIG_KEY = "google_drive_config";
+  const ONEDRIVE_CONFIG_KEY = "onedrive_config";
+
+  // Cloud storage provider configuration
+  const CLOUD_CONFIG = {
+    local: { name: "本地文件夹", icon: "📁" },
+    google: { name: "Google Drive", icon: "☁️" },
+    onedrive: { name: "OneDrive", icon: "🔷" },
+  };
+
+  // Current cloud storage state
+  let cloudStorage = {
+    provider: "local", // "local" | "google" | "onedrive"
+    googleToken: null,
+    onedriveToken: null,
+    googleFolderId: null, // Google Drive folder ID
+    onedriveFolderId: null, // OneDrive folder path
+  };
+
+  // User-configurable API credentials (stored in IndexedDB)
+  let googleDriveConfig = {
+    clientId: "",
+    apiKey: "",
+  };
+
+  let onedriveConfig = {
+    clientId: "",
+  };
+
+  // Google Drive API config
+  const GOOGLE_SCOPES = "https://www.googleapis.com/auth/drive.file";
+
+  // OneDrive API config
+  const ONEDRIVE_REDIRECT_URI = window.location.origin;
+  const ONEDRIVE_SCOPES = ["Files.ReadWrite", "Files.ReadWrite.All"];
+
+  /* ============================================================
+     IndexedDB helpers
+     ============================================================ */
+  function idbOpen() {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open(IDB_NAME, 1);
+      req.onupgradeneeded = (e) => {
+        const db = e.target.result;
+        if (!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE);
+      };
+      req.onsuccess = (e) => { idb = e.target.result; resolve(idb); };
+      req.onerror = (e) => reject(e.target.error);
+    });
+  }
+  function idbPut(key, value) {
+    return new Promise((resolve, reject) => {
+      if (!idb) return resolve();
+      const tx = idb.transaction(IDB_STORE, "readwrite");
+      tx.objectStore(IDB_STORE).put(value, key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+  function idbGet(key) {
+    return new Promise((resolve, reject) => {
+      if (!idb) return resolve(undefined);
+      const tx = idb.transaction(IDB_STORE, "readonly");
+      const req = tx.objectStore(IDB_STORE).get(key);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+  function idbDel(key) {
+    return new Promise((resolve, reject) => {
+      if (!idb) return resolve();
+      const tx = idb.transaction(IDB_STORE, "readwrite");
+      tx.objectStore(IDB_STORE).delete(key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  /* ============================================================
+     V4 — Cloud Storage Helpers
+     ============================================================ */
+  async function loadCloudStorageState() {
+    try {
+      const saved = await idbGet(CLOUD_STORAGE_KEY);
+      if (saved) {
+        cloudStorage.provider = saved.provider || "local";
+        cloudStorage.googleFolderId = saved.googleFolderId || null;
+        cloudStorage.onedriveFolderId = saved.onedriveFolderId || null;
+      }
+      // Load tokens
+      const googleToken = await idbGet(GOOGLE_DRIVE_TOKEN_KEY);
+      if (googleToken && googleToken.expires_at > Date.now()) {
+        cloudStorage.googleToken = googleToken;
+      }
+      const onedriveToken = await idbGet(ONEDRIVE_TOKEN_KEY);
+      if (onedriveToken && onedriveToken.expires_at > Date.now()) {
+        cloudStorage.onedriveToken = onedriveToken;
+      }
+      // Load API configs
+      const googleCfg = await idbGet(GOOGLE_CONFIG_KEY);
+      if (googleCfg) {
+        googleDriveConfig.clientId = googleCfg.clientId || "";
+        googleDriveConfig.apiKey = googleCfg.apiKey || "";
+      }
+      const onedriveCfg = await idbGet(ONEDRIVE_CONFIG_KEY);
+      if (onedriveCfg) {
+        onedriveConfig.clientId = onedriveCfg.clientId || "";
+      }
+    } catch (e) {
+      console.warn("Failed to load cloud storage state", e);
+    }
+  }
+
+  async function saveCloudStorageState() {
+    try {
+      await idbPut(CLOUD_STORAGE_KEY, {
+        provider: cloudStorage.provider,
+        googleFolderId: cloudStorage.googleFolderId,
+        onedriveFolderId: cloudStorage.onedriveFolderId,
+      });
+    } catch (e) {
+      console.warn("Failed to save cloud storage state", e);
+    }
+  }
+
+  /* ============================================================
+     V4 — Google Drive Integration
+     ============================================================ */
+  function isGoogleDriveConfigured() {
+    return googleDriveConfig.clientId && googleDriveConfig.apiKey;
+  }
+
+  async function authenticateGoogleDrive() {
+    if (!isGoogleDriveConfigured()) {
+      toast("请先在配置中填写 Google Drive 的 Client ID 和 API Key", "error");
+      return false;
+    }
+
+    try {
+      // Use OAuth2.0 implicit flow for Google Drive
+      const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?` +
+        `client_id=${encodeURIComponent(googleDriveConfig.clientId)}` +
+        `&redirect_uri=${encodeURIComponent(window.location.origin)}` +
+        `&response_type=token` +
+        `&scope=${encodeURIComponent(GOOGLE_SCOPES)}` +
+        `&prompt=consent`;
+
+      // Open popup for authentication
+      const popup = window.open(authUrl, "googleAuth", "width=500,height=600");
+
+      // Listen for the redirect
+      return new Promise((resolve) => {
+        const authTimer = setInterval(() => {
+          try {
+            if (popup.closed) {
+              clearInterval(authTimer);
+              resolve(false);
+              return;
+            }
+            const url = popup.location.href;
+            if (url.includes("#")) {
+              const params = new URLSearchParams(url.split("#")[1]);
+              const accessToken = params.get("access_token");
+              if (accessToken) {
+                cloudStorage.googleToken = {
+                  access_token: accessToken,
+                  expires_at: Date.now() + (parseInt(params.get("expires_in")) || 3600) * 1000,
+                };
+                idbPut(GOOGLE_DRIVE_TOKEN_KEY, cloudStorage.googleToken);
+                popup.close();
+                clearInterval(authTimer);
+                toast("Google Drive 认证成功", "success");
+                resolve(true);
+              }
+            }
+          } catch (e) {
+            // Cross-origin, waiting for redirect
+          }
+        }, 500);
+      });
+    } catch (e) {
+      console.error("Google Drive auth failed", e);
+      toast("Google Drive 认证失败: " + e.message, "error");
+      return false;
+    }
+  }
+
+  async function googleDriveUpload(fileName, data) {
+    if (!cloudStorage.googleToken || !cloudStorage.googleToken.access_token) {
+      toast("请先登录 Google Drive", "error");
+      return false;
+    }
+
+    try {
+      // First, delete previous file if exists
+      if (currentAutoSaveFileName) {
+        await googleDriveDeleteFile(currentAutoSaveFileName);
+      }
+
+      // Create file metadata
+      const metadata = {
+        name: fileName,
+        mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      };
+
+      // If we have a folder ID, add it to metadata
+      if (cloudStorage.googleFolderId) {
+        metadata.parents = [cloudStorage.googleFolderId];
+      }
+
+      // Create form data
+      const formData = new FormData();
+      formData.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
+      formData.append("file", new Blob([data], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }));
+
+      const response = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${cloudStorage.googleToken.access_token}`,
+        },
+        body: formData,
+      });
+
+      if (!response.ok) {
+        throw new Error(`Upload failed: ${response.statusText}`);
+      }
+
+      const result = await response.json();
+      currentAutoSaveFileName = fileName;
+      await idbPut(LAST_SAVE_NAME_KEY, fileName);
+      return true;
+    } catch (e) {
+      console.error("Google Drive upload failed", e);
+      toast("Google Drive 上传失败: " + e.message, "error");
+      return false;
+    }
+  }
+
+  async function googleDriveDeleteFile(fileName) {
+    if (!cloudStorage.googleToken || !cloudStorage.googleToken.access_token) return;
+
+    try {
+      // Search for the file by name
+      let query = `name='${fileName}' and trashed=false`;
+      if (cloudStorage.googleFolderId) {
+        query += ` and '${cloudStorage.googleFolderId}' in parents`;
+      }
+
+      const searchResponse = await fetch(
+        `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id)`,
+        {
+          headers: {
+            "Authorization": `Bearer ${cloudStorage.googleToken.access_token}`,
+          },
+        }
+      );
+
+      if (searchResponse.ok) {
+        const result = await searchResponse.json();
+        if (result.files && result.files.length > 0) {
+          // Delete all matching files
+          for (const file of result.files) {
+            await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}`, {
+              method: "DELETE",
+              headers: {
+                "Authorization": `Bearer ${cloudStorage.googleToken.access_token}`,
+              },
+            });
+          }
+        }
+      }
+    } catch (e) {
+      console.warn("Google Drive delete failed (non-critical)", e);
+    }
+  }
+
+  /* ============================================================
+     V4 — OneDrive Integration
+     ============================================================ */
+  function isOneDriveConfigured() {
+    return onedriveConfig.clientId;
+  }
+
+  let msalInstance = null;
+
+  async function authenticateOneDrive() {
+    if (!isOneDriveConfigured()) {
+      toast("请先在配置中填写 OneDrive 的 Client ID", "error");
+      return false;
+    }
+
+    try {
+      if (!msalInstance) {
+        msalInstance = new msal.PublicClientApplication({
+          auth: {
+            clientId: onedriveConfig.clientId,
+            redirectUri: ONEDRIVE_REDIRECT_URI,
+          },
+        });
+      }
+
+      const loginRequest = {
+        scopes: ONEDRIVE_SCOPES,
+      };
+
+      const response = await msalInstance.loginPopup(loginRequest);
+      cloudStorage.onedriveToken = {
+        access_token: response.accessToken,
+        expires_at: Date.now() + (response.expiresIn || 3600) * 1000,
+      };
+      await idbPut(ONEDRIVE_TOKEN_KEY, cloudStorage.onedriveToken);
+      toast("OneDrive 认证成功", "success");
+      return true;
+    } catch (e) {
+      console.error("OneDrive auth failed", e);
+      if (e.errorCode !== "user_cancelled") {
+        toast("OneDrive 认证失败: " + e.message, "error");
+      }
+      return false;
+    }
+  }
+
+  async function getOneDriveToken() {
+    if (!msalInstance) return null;
+
+    const accounts = msalInstance.getAllAccounts();
+    if (accounts.length === 0) return null;
+
+    try {
+      const response = await msalInstance.acquireTokenSilent({
+        account: accounts[0],
+        scopes: ONEDRIVE_SCOPES,
+      });
+      return response.accessToken;
+    } catch (e) {
+      // Silent acquisition failed, try popup
+      try {
+        const response = await msalInstance.acquireTokenPopup({
+          scopes: ONEDRIVE_SCOPES,
+        });
+        return response.accessToken;
+      } catch (e2) {
+        console.error("OneDrive token refresh failed", e2);
+        return null;
+      }
+    }
+  }
+
+  async function onedriveUpload(fileName, data) {
+    const accessToken = await getOneDriveToken();
+    if (!accessToken) {
+      toast("请先登录 OneDrive", "error");
+      return false;
+    }
+
+    try {
+      // First, delete previous file if exists
+      if (currentAutoSaveFileName) {
+        await onedriveDeleteFile(currentAutoSaveFileName);
+      }
+
+      // Determine upload path
+      const folderPath = cloudStorage.onedriveFolderId || "/Documents";
+      const uploadPath = `${folderPath}/${fileName}`;
+
+      // Upload file
+      const response = await fetch(
+        `https://graph.microsoft.com/v1.0/me/drive/root:${uploadPath}:/content`,
+        {
+          method: "PUT",
+          headers: {
+            "Authorization": `Bearer ${accessToken}`,
+            "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+          },
+          body: data,
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error(`Upload failed: ${response.statusText}`);
+      }
+
+      currentAutoSaveFileName = fileName;
+      await idbPut(LAST_SAVE_NAME_KEY, fileName);
+      return true;
+    } catch (e) {
+      console.error("OneDrive upload failed", e);
+      toast("OneDrive 上传失败: " + e.message, "error");
+      return false;
+    }
+  }
+
+  async function onedriveDeleteFile(fileName) {
+    const accessToken = await getOneDriveToken();
+    if (!accessToken) return;
+
+    try {
+      const folderPath = cloudStorage.onedriveFolderId || "/Documents";
+      const filePath = `${folderPath}/${fileName}`;
+
+      await fetch(
+        `https://graph.microsoft.com/v1.0/me/drive/root:${filePath}`,
+        {
+          method: "DELETE",
+          headers: {
+            "Authorization": `Bearer ${accessToken}`,
+          },
+        }
+      );
+    } catch (e) {
+      console.warn("OneDrive delete failed (non-critical)", e);
+    }
+  }
+
+
+  /* ============================================================
+     CONTACT TYPE DETECTION (V2 — judges by content, not TYPE column)
+     ============================================================ */
+  function detectContactType(value) {
+    const v = String(value || "").trim();
+    if (!v) return "Others";
+    // Email: standard email pattern
+    if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)) return "Email";
+    // Website: starts with http:// or https://
+    if (/^https?:\/\//i.test(v)) return "Website";
+    // Website without protocol: domain-like (e.g. example.com, www.example.com)
+    // Must contain a dot, have no spaces, and look like a domain
+    if (/^(www\.)?[a-z0-9]([a-z0-9-]*\.)+[a-z]{2,}(\/[^\s]*)?$/i.test(v)) return "Website";
+    // Phone: mostly digits with +, spaces, dashes, parentheses, at least 7 chars
+    if (/^[+]?[\d\s\-()]{7,}$/.test(v) && /\d{4,}/.test(v.replace(/[\s\-()]/g, ""))) return "Phone";
+    // WhatsApp: often a long number with country code
+    if (/^[+]\d{6,}$/.test(v.replace(/\s/g, ""))) return "WhatsApp";
+    // Default
+    return "Others";
+  }
+
+  function typeBadgeClass(type) {
+    const t = String(type || "").toLowerCase();
+    if (t === "email" || t === "e-mail") return "email";
+    if (t === "website") return "website";
+    if (t === "phone" || t === "whatsapp" || t === "wechat") return "phone";
+    return "other";
+  }
+
+  function typeBadgeLetter(type) {
+    const t = String(type || "").toLowerCase();
+    if (t === "email" || t === "e-mail") return "@";
+    if (t === "website") return "W";
+    if (t === "whatsapp") return "WA";
+    if (t === "phone" || t === "wechat") return "T";
+    return "?";
+  }
+
+  /* ============================================================
+     V2.4: Phone number formatting
+     Storage keeps "|" prefix (prevents Excel float conversion).
+     Display strips "|" and shows clean number with country code.
+     ============================================================ */
+  function displayContactValue(val) {
+    let v = String(val || "");
+    // Strip leading "|" (Excel text marker)
+    if (v.startsWith("|")) v = v.slice(1);
+    return v;
+  }
+
+  function storeContactValue(val) {
+    let v = String(val || "").trim();
+    if (!v) return v;
+    // If it's a phone number (digits with optional + and separators) and doesn't start with |,
+    // add | prefix to keep Excel from converting to float
+    const detected = detectContactType(v);
+    if ((detected === "Phone" || detected === "WhatsApp") && !v.startsWith("|")) {
+      v = "|" + v;
+    }
+    return v;
+  }
+
+  /* ============================================================
+     V2.4: WhatsApp integration — opens WhatsApp app/web
+     ============================================================ */
+  function openWhatsApp(rawValue) {
+    // Extract digits for wa.me URL: strip |, +, spaces, dashes, parentheses
+    let digits = String(rawValue || "").replace(/^\|/, "").replace(/[^\d]/g, "");
+    if (!digits) { toast("无法识别 WhatsApp 号码", "error"); return; }
+    // Copy to clipboard
+    navigator.clipboard.writeText(rawValue.replace(/^\|/, "")).then(() => {}).catch(() => {});
+    // Use https://wa.me/ — works on desktop (opens WhatsApp Web or app) and mobile
+    const url = `https://wa.me/${digits}`;
+    window.open(url, "_blank");
+    toast(`已打开 WhatsApp（号码：${displayContactValue(rawValue)}）`, "success");
+  }
+
+  /* ============================================================
+     EMAIL / WEBSITE ACTION (V2.1 — Foxmail + mailto)
+     ============================================================ */
+  function openEmailCompose(email) {
+    // Copy to clipboard
+    navigator.clipboard.writeText(email).then(() => {}).catch(() => {});
+    // Use mailto: protocol — opens system default mail client (Foxmail)
+    const c = state.customers[state.currentIdx];
+    const subject = c && c.Company ? `${c.Company} — 跟进` : "客户跟进";
+    const mailtoUrl = `mailto:${encodeURIComponent(email)}?subject=${encodeURIComponent(subject)}`;
+    window.location.href = mailtoUrl;
+    toast(`邮箱已复制 · 已打开 Foxmail 写信（收件人：${email}）`, "success");
+  }
+
+  function openWebsite(url) {
+    let u = String(url).trim();
+    if (!/^https?:\/\//i.test(u)) u = "https://" + u;
+    window.open(u, "_blank");
+    toast("已打开网站", "success");
+  }
+
+  // V2.4: Unified contact action — decides by detected type AND Type column
+  function triggerContactAction(contactValue, typeColumn) {
+    const rawVal = String(contactValue || "").trim();
+    if (!rawVal || rawVal === "new_contact") return;
+    const cleanVal = displayContactValue(rawVal);
+    const detected = detectContactType(cleanVal);
+    const typeLower = String(typeColumn || "").toLowerCase();
+
+    if (detected === "Email") {
+      openEmailCompose(cleanVal);
+    } else if (detected === "Website") {
+      openWebsite(cleanVal);
+    } else if (typeLower === "whatsapp" || detected === "WhatsApp") {
+      openWhatsApp(rawVal);
+    }
+    // Phone (non-WhatsApp) / Others: no external action (just mark contact)
+  }
 
   /* ============================================================
      STATE
      ============================================================ */
   const state = {
-    customers: [],          // array of customer objects (see normalizeCustomer)
-    currentIdx: -1,         // index into state.customers
-    filteredIdx: [],        // indices of filtered customers
-    filterPage: 0,          // pointer into filteredIdx
+    customers: [],
+    currentIdx: -1,
+    filteredIdx: [],
+    filterPage: 0,
     config: loadConfig(),
     dirty: false,
     fileName: "",
@@ -94,16 +644,14 @@
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
   /* ============================================================
-     CONTACTS SERIALIZATION  (mirrors Python <Key:Value> format)
+     CONTACTS SERIALIZATION
      ============================================================ */
   function parseContactsString(str) {
     if (!str) return [];
     const cleaned = String(str).replace(/\r/g, "");
-    // split on ; but the format uses ;\n between entries
     const parts = cleaned.split(/\n|;|\t/).map(s => s.trim()).filter(Boolean);
     const contacts = [];
     for (const part of parts) {
-      // contact value = everything before first <
       const ltIdx = part.indexOf("<");
       let contactVal, rest;
       if (ltIdx === -1) { contactVal = part; rest = ""; }
@@ -141,24 +689,18 @@
       c[col] = rawRow[col] != null ? rawRow[col] : "";
     }
     if (c.Index === "" || c.Index == null) c.Index = index + 1;
-    // parse contacts
     c._contacts = parseContactsString(c.Contacts);
-    // ensure ID
     if (!c.ID || String(c.ID).trim() === "") {
       c.ID = genId() + " " + (c.Region || "未知地区") + " " + (c.Category || "未知品类") + " " + (c.Company || "未知公司");
     }
-    // auto dates
     autoSetDates(c);
     return c;
   }
 
   function autoSetDates(c) {
     const today = todayStr();
-    // Set date
     if (!parseDate(c.Set)) c.Set = today;
     else c.Set = fmtDate(c.Set);
-
-    // Last = nearest Com_Last across contacts
     let nearest = null;
     for (const ct of c._contacts) {
       const d = parseDate(ct.Com_Last);
@@ -167,13 +709,10 @@
       }
     }
     c.Last = nearest ? nearest.toISOString().slice(0, 10) : "2000-01-01";
-
-    // Next: if current Next <= today, recompute based on rating offset
     const nextDate = parseDate(c.Next);
     const rating = c.Rating || "普通";
     const offset = state.config.ratingOffset[rating] != null ? state.config.ratingOffset[rating] : 30;
     if (!nextDate || nextDate <= new Date(today)) {
-      // check if any contact was contacted today or later
       const contactedToday = c._contacts.some(ct => {
         const d = parseDate(ct.Com_Last);
         return d && d >= new Date(today);
@@ -183,7 +722,6 @@
       } else if (!nextDate) {
         c.Next = today;
       }
-      // else keep overdue date
     } else {
       c.Next = fmtDate(c.Next);
     }
@@ -212,7 +750,7 @@
   }
 
   /* ============================================================
-     EXCEL IMPORT / EXPORT  (SheetJS)
+     EXCEL IMPORT / EXPORT
      ============================================================ */
   function importExcel(file) {
     const reader = new FileReader();
@@ -221,36 +759,26 @@
         const data = new Uint8Array(e.target.result);
         const wb = XLSX.read(data, { type: "array", cellDates: true });
         const result = { customers: [], config: null, newList: [], convertList: [] };
-
-        // Parse config sheet if present
         if (wb.SheetNames.includes("config")) {
           const ws = wb.Sheets["config"];
           const cfgArr = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" });
           result.config = parseConfigSheet(cfgArr);
         }
-
-        // Parse Sheet1 (main customer list)
         const mainName = wb.SheetNames.find(n => /^Sheet1$/i.test(n)) || wb.SheetNames[0];
         if (mainName) {
           const ws = wb.Sheets[mainName];
           const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
           result.customers = rows.map((r, i) => normalizeCustomer(r, i));
         }
-
-        // Parse NewList if present
         if (wb.SheetNames.includes("NewList")) {
           const ws = wb.Sheets["NewList"];
           result.newList = XLSX.utils.sheet_to_json(ws, { defval: "" });
         }
-
-        // Parse ConvertList if present
         if (wb.SheetNames.includes("ConvertList")) {
           const ws = wb.Sheets["ConvertList"];
           const raw = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" });
           result.convertList = raw;
         }
-
-        // Apply
         if (result.config) {
           state.config = result.config;
           saveConfig();
@@ -285,7 +813,6 @@
     const colFrom = findCol("From_cfg");
     const colType = findCol("Contact_Type_cfg");
     const colStatus = findCol("Contact_Status_cfg");
-
     cfg.ratingList = [];
     cfg.ratingOffset = {};
     for (let i = 1; i < arr.length; i++) {
@@ -316,14 +843,8 @@
     return cfg;
   }
 
-  function exportExcel() {
-    if (state.customers.length === 0) {
-      toast("没有数据可导出", "error");
-      return;
-    }
+  function buildWorkbook() {
     const wb = XLSX.utils.book_new();
-
-    // Sheet1 — main customer data
     const exportRows = state.customers.map((c, i) => {
       const row = {};
       for (const col of CUSTOMER_COLUMNS) {
@@ -334,8 +855,6 @@
     });
     const ws1 = XLSX.utils.json_to_sheet(exportRows, { header: CUSTOMER_COLUMNS });
     XLSX.utils.book_append_sheet(wb, ws1, "Sheet1");
-
-    // config sheet
     const cfgMax = Math.max(
       state.config.ratingList.length,
       state.config.categoryList.length,
@@ -361,52 +880,89 @@
     }
     const wsCfg = XLSX.utils.json_to_sheet(cfgRows);
     XLSX.utils.book_append_sheet(wb, wsCfg, "config");
-
-    // NewList (empty template with header)
     const wsNew = XLSX.utils.json_to_sheet([], { header: CUSTOMER_COLUMNS });
     XLSX.utils.book_append_sheet(wb, wsNew, "NewList");
-
-    // ConvertList (empty template)
+    // V2.4: ConvertList — include exported combined rows if any
     const convHeaders = [...CONTACT_COLUMNS, ...CUSTOMER_COLUMNS.filter(c => c !== "Contacts")];
-    const wsConv = XLSX.utils.json_to_sheet([], { header: convHeaders });
+    const wsConv = XLSX.utils.json_to_sheet(state._convertList || [], { header: convHeaders });
     XLSX.utils.book_append_sheet(wb, wsConv, "ConvertList");
+    return wb;
+  }
 
+  /* ============================================================
+     V2.4: Export filtered customers to ConvertList
+     Each contact becomes a row, with customer info repeated.
+     ============================================================ */
+  function exportToConvertList() {
+    if (state.filteredIdx.length === 0) {
+      toast("没有筛选出的客户可导出", "error");
+      return;
+    }
+    const convRows = [];
+    const customerCols = CUSTOMER_COLUMNS.filter(c => c !== "Contacts");
+    for (const idx of state.filteredIdx) {
+      const c = state.customers[idx];
+      for (const ct of c._contacts) {
+        const row = {};
+        // contact columns first
+        for (const col of CONTACT_COLUMNS) row[col] = ct[col] != null ? ct[col] : "";
+        // customer columns (except Contacts)
+        for (const col of customerCols) {
+          if (col === "Index") row[col] = "";
+          else row[col] = c[col] != null ? c[col] : "";
+        }
+        convRows.push(row);
+      }
+    }
+    state._convertList = convRows;
+    saveToLocal();
+    toast(`已导出 ${state.filteredIdx.length} 个客户（${convRows.length} 条联系方式）到 ConvertList`, "success");
+    // Also trigger Excel download so user has the file
+    const wb = buildWorkbook();
+    const ts = new Date().toISOString().slice(0, 10);
+    XLSX.writeFile(wb, `客户总表_ConvertList_${ts}.xlsx`);
+  }
+
+  function exportExcel() {
+    if (state.customers.length === 0) {
+      toast("没有数据可导出", "error");
+      return;
+    }
+    const wb = buildWorkbook();
     const ts = new Date().toISOString().slice(0, 10);
     XLSX.writeFile(wb, `客户总表_${ts}.xlsx`);
     toast("Excel 已导出", "success");
   }
 
   /* ============================================================
-     LOCALSTORAGE PERSISTENCE
+     PERSISTENCE — IndexedDB
      ============================================================ */
   function saveToLocal() {
-    try {
-      const slim = state.customers.map(c => {
-        const out = {};
-        for (const col of CUSTOMER_COLUMNS) out[col] = c[col];
-        return out;
-      });
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({
-        customers: slim,
-        fileName: state.fileName,
-        savedAt: new Date().toISOString(),
-      }));
-    } catch (e) { console.warn("localStorage save failed", e); }
+    if (!idb) return;
+    const slim = state.customers.map(c => {
+      const out = {};
+      for (const col of CUSTOMER_COLUMNS) out[col] = c[col];
+      return out;
+    });
+    idbPut("customers", {
+      customers: slim,
+      fileName: state.fileName,
+      savedAt: new Date().toISOString(),
+    }).catch(e => console.warn("IDB save failed", e));
   }
 
-  function loadFromLocal() {
+  async function loadFromLocal() {
+    if (!idb) return false;
     try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (!raw) return false;
-      const obj = JSON.parse(raw);
-      if (!obj.customers || obj.customers.length === 0) return false;
+      const obj = await idbGet("customers");
+      if (!obj || !obj.customers || obj.customers.length === 0) return false;
       state.customers = obj.customers.map((r, i) => normalizeCustomer(r, i));
       state.fileName = obj.fileName || "(本地存档)";
       state.currentIdx = 0;
       state.filteredIdx = state.customers.map((_, i) => i);
       $("lastSaved").textContent = "本地存档 · " + (obj.savedAt ? new Date(obj.savedAt).toLocaleString() : "");
       return true;
-    } catch (e) { return false; }
+    } catch (e) { console.warn("IDB load failed", e); return false; }
   }
 
   /* ============================================================
@@ -418,11 +974,9 @@
     const rating = $("filterRating").value;
     const followup = $("filterFollowup").checked;
     const today = todayStr();
-
     state.filteredIdx = [];
     for (let i = 0; i < state.customers.length; i++) {
       const c = state.customers[i];
-      // text search across multiple fields
       if (q) {
         const haystack = [c.ID, c.Company, c.Website, c.Region, c.Category, c.From, c.Log,
           ...c._contacts.map(ct => ct.Contact + " " + ct.Name)].join(" ").toLowerCase();
@@ -458,8 +1012,6 @@
       return nd && nd <= new Date(today);
     }).length;
     $("statFollowup").textContent = followupCount;
-
-    // rating breakdown
     const counts = {};
     for (const c of state.customers) {
       const r = c.Rating || "未分类";
@@ -507,7 +1059,6 @@
       </div>`;
     }).join("");
     body.innerHTML = html;
-    // bind click
     body.querySelectorAll(".customer-card").forEach(el => {
       el.addEventListener("click", () => {
         const idx = parseInt(el.dataset.idx);
@@ -606,7 +1157,7 @@
 
         <div class="sub-section">
           <div class="sub-header">
-            <span class="sub-title">联系方式 (双击单元格编辑/操作)</span>
+            <span class="sub-title">联系方式</span>
             <div class="sub-actions">
               <button class="sbtn small" id="addContact">+ 添加</button>
             </div>
@@ -614,12 +1165,17 @@
           <div class="contacts-table" id="contactsTable">
             <div class="contacts-row header">
               <div>Type</div><div>Contact</div><div>Name</div><div>Status</div>
-              <div>Com_Last</div><div>Records</div><div></div>
+              <div>Com_Last</div><div>Records</div><div>联系</div><div></div>
             </div>
             ${renderContactsRows(c)}
           </div>
-          <div style="font-size:11px;color:var(--ink-faint);margin-top:4px;">
-            提示：双击 Type/Status 切换值 · 双击 Com_Last 标记今日联系 · 双击 Com_Records 标记获得回复 · 双击 Contact 复制到剪贴板
+          <div style="font-size:11px;color:var(--ink-faint);margin-top:4px;line-height:1.6;">
+            <b style="color:var(--ink-dim)">操作提示：</b><br>
+            • <span style="color:var(--accent)">点击「联系」按钮</span>：邮箱→Foxmail 写信，网址→打开网站，号码→仅标记；同时自动标记今日联系（Com_Last + Records 更新）<br>
+            • <span style="color:var(--accent)">双击 Contact / Name</span>：进入编辑<br>
+            • <span style="color:var(--accent)">双击 Type / Status</span>：循环切换值<br>
+            • <span style="color:var(--accent)">双击 Com_Last</span>：标记今日联系 · <span style="color:var(--accent)">双击 Records</span>：标记获得回复<br>
+            • <span style="color:var(--accent)">添加联系方式</span>：自动识别邮箱/网址/号码类型 · 内容过长自动省略，悬停可查看完整内容
           </div>
         </div>
 
@@ -646,23 +1202,57 @@
       return `<div class="contacts-row"><div style="grid-column:1/-1;color:var(--ink-faint);justify-content:center;">暂无联系方式，点击「+ 添加」</div></div>`;
     }
     const today = todayStr();
-    return c._contacts.map((ct, i) => {
+    // V2.2: display-layer sort by Com_Last desc (most recent first).
+    const indexed = c._contacts.map((ct, i) => ({
+      ct, i,
+      d: parseDate(ct.Com_Last) || new Date(0),
+    }));
+    indexed.sort((a, b) => b.d - a.d);
+    return indexed.map(({ ct, i }) => {
       const cl = fmtDate(ct.Com_Last);
       const isToday = cl === today;
+      const cleanVal = displayContactValue(ct.Contact);
+      const detectedType = detectContactType(cleanVal);
+      const badgeCls = typeBadgeClass(detectedType);
+      const badgeLetter = typeBadgeLetter(detectedType);
+      const textCls = badgeCls;
+      // V2.4: WhatsApp badge if Type column says WhatsApp
+      const typeLower = String(ct.Type || "").toLowerCase();
+      const isWhatsApp = typeLower === "whatsapp";
+      const actionTitle = detectedType === "Email"
+        ? "联系：Foxmail 写信 + 标记今日联系"
+        : detectedType === "Website"
+        ? "联系：打开网站 + 标记今日联系"
+        : isWhatsApp
+        ? "联系：打开 WhatsApp + 标记今日联系"
+        : "联系：标记今日联系";
+      const btnIcon = detectedType === "Email"
+        ? `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16v16H4z"/><path d="M4 4l8 7 8-7"/></svg>`
+        : detectedType === "Website"
+        ? `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>`
+        : isWhatsApp
+        ? `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.36 1.9.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.91.34 1.85.57 2.81.7A2 2 0 0 1 22 16.92z"/></svg>`
+        : `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.36 1.9.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.91.34 1.85.57 2.81.7A2 2 0 0 1 22 16.92z"/></svg>`;
       return `<div class="contacts-row" data-i="${i}">
-        <div class="c-type" data-i="${i}">${escapeHtml(ct.Type)}</div>
-        <div class="c-contact" data-i="${i}" title="点击复制">${escapeHtml(ct.Contact)}</div>
-        <div class="c-name" data-i="${i}">${escapeHtml(ct.Name)}</div>
-        <div class="c-status" data-i="${i}">${escapeHtml(ct.Status)}</div>
+        <div class="c-type" data-i="${i}" title="${escapeHtml(ct.Type)}">${escapeHtml(ct.Type)}</div>
+        <div class="c-contact" data-i="${i}" title="${escapeHtml(cleanVal)}">
+          <div class="c-contact-wrap">
+            <span class="c-type-badge ${badgeCls}" title="${escapeHtml(detectedType)}">${badgeLetter}</span>
+            <span class="c-contact-text ${textCls}" title="${escapeHtml(cleanVal)}">${escapeHtml(cleanVal)}</span>
+          </div>
+        </div>
+        <div class="c-name" data-i="${i}" title="${escapeHtml(ct.Name)}">${escapeHtml(ct.Name)}</div>
+        <div class="c-status" data-i="${i}" title="${escapeHtml(ct.Status)}">${escapeHtml(ct.Status)}</div>
         <div class="c-comlast ${isToday ? "contact-today" : ""}" data-i="${i}">${escapeHtml(cl)}</div>
         <div class="c-comrecords" data-i="${i}">${escapeHtml(ct.Com_Records)}</div>
+        <div class="c-contactbtn ${isToday ? "contact-today" : ""}" data-i="${i}" title="${escapeHtml(actionTitle)}">${btnIcon}</div>
         <div class="c-del" data-i="${i}" title="删除">×</div>
       </div>`;
     }).join("");
   }
 
   /* ============================================================
-     DETAIL EVENT BINDING
+     DETAIL EVENT BINDING  (V2 — contacts module changed)
      ============================================================ */
   function bindDetailEvents(c) {
     // Field inputs — live update on change
@@ -670,10 +1260,6 @@
       el.addEventListener("change", () => {
         const col = el.dataset.col;
         c[col] = el.value;
-        if (col === "Rating") { /* handled by chips */ }
-        if (col === "Region" || col === "Category") {
-          // rebuild ID suffix? keep as-is
-        }
         autoSetDates(c);
         state.dirty = true;
         renderList();
@@ -706,19 +1292,54 @@
       });
     });
 
-    // Add contact
+    // V2: Add contact — inline input with auto-type-detection
     $("addContact").addEventListener("click", () => {
-      c._contacts.push({
-        Type: "Email", Contact: "new_contact", Name: "new_name",
-        Status: "Active", Com_Last: "2000-01-01", Com_Records: "0r0"
-      });
-      syncContactsToCustomer(c);
-      state.dirty = true;
-      renderDetail();
+      addContactInline(c);
     });
 
-    // Contacts table interactions
+    // V2: Contacts table interactions
     const table = $("contactsTable");
+
+    // V2.3: click handler — "联系" button triggers open + marks today's contact.
+    table.addEventListener("click", (e) => {
+      // "联系" button
+      const btnEl = e.target.closest(".c-contactbtn");
+      if (btnEl) {
+        const i = parseInt(btnEl.dataset.i);
+        const ct = c._contacts[i];
+        if (!ct) return;
+        // 1) trigger the contact action (email/website/WhatsApp) via unified handler
+        triggerContactAction(ct.Contact, ct.Type);
+        // 2) mark today's contact (same as dblclick on Com_Last)
+        const today = todayStr();
+        const cur = fmtDate(ct.Com_Last);
+        const displayVal = displayContactValue(ct.Contact);
+        if (cur !== today) {
+          ct.Com_Last = today;
+          ct.Com_Records = bumpPair(ct.Com_Records, true);
+          c.Log = (c.Log || "") + `\n ${today}: 联系了 ${displayVal}`;
+          $("logArea").value = c.Log;
+          toast(`已记录今日联系: ${displayVal}`, "success");
+        } else {
+          toast("今日已联系过", "error");
+        }
+        syncContactsToCustomer(c);
+        state.dirty = true;
+        renderDetail();
+        renderList();
+        return;
+      }
+      // Delete contact (single click on ×)
+      if (e.target.classList.contains("c-del")) {
+        const i = parseInt(e.target.dataset.i);
+        c._contacts.splice(i, 1);
+        syncContactsToCustomer(c);
+        state.dirty = true;
+        renderDetail();
+      }
+    });
+
+    // DOUBLE CLICK — V2: Contact/Name only edit; Type/Status/Com_Last/Records unchanged
     table.addEventListener("dblclick", (e) => {
       const target = e.target.closest("[data-i]");
       if (!target) return;
@@ -736,7 +1357,6 @@
         const idx = list.indexOf(ct.Status);
         ct.Status = list[(idx + 1) % list.length];
       } else if (cls.includes("c-comlast")) {
-        // mark contacted today
         const today = todayStr();
         const cur = fmtDate(ct.Com_Last);
         if (cur !== today) {
@@ -749,15 +1369,22 @@
           toast("今日已联系过", "error");
         }
       } else if (cls.includes("c-comrecords")) {
-        // mark got reply
         ct.Com_Last = todayStr();
         ct.Com_Records = bumpPair(ct.Com_Records, false);
         c.Log = (c.Log || "") + `\n ${todayStr()}: 获得 ${ct.Contact} 的回复`;
         $("logArea").value = c.Log;
         toast(`已记录回复: ${ct.Contact}`, "success");
-      } else if (cls.includes("c-contact") || cls.includes("c-name")) {
-        // inline edit
-        inlineEdit(target, ct, cls.includes("c-contact") ? "Contact" : "Name", () => {
+      } else if (cls.includes("c-contact")) {
+        // V2: only edit, no copy
+        inlineEditContact(target, ct, () => {
+          syncContactsToCustomer(c);
+          state.dirty = true;
+          renderDetail();
+        });
+        return;
+      } else if (cls.includes("c-name")) {
+        // V2: only edit, no copy
+        inlineEdit(target, ct, "Name", () => {
           syncContactsToCustomer(c);
           state.dirty = true;
           renderDetail();
@@ -768,30 +1395,6 @@
       state.dirty = true;
       renderDetail();
       renderList();
-    });
-
-    // single click on contact = copy
-    table.addEventListener("click", (e) => {
-      if (e.target.classList.contains("c-contact") && !e.detail || e.detail === 1) {
-        // use a small delay to distinguish from dblclick
-        const val = e.target.textContent;
-        setTimeout(() => {
-          if (e.detail === 1) {
-            navigator.clipboard.writeText(val).then(() => toast(`已复制: ${val}`)).catch(() => {});
-          }
-        }, 200);
-      }
-    });
-
-    // Delete contact
-    table.addEventListener("click", (e) => {
-      if (e.target.classList.contains("c-del")) {
-        const i = parseInt(e.target.dataset.i);
-        c._contacts.splice(i, 1);
-        syncContactsToCustomer(c);
-        state.dirty = true;
-        renderDetail();
-      }
     });
 
     // Log live update
@@ -832,6 +1435,115 @@
     });
   }
 
+  /* ============================================================
+     V2: Add contact with inline input + auto type detection
+     ============================================================ */
+  function addContactInline(c) {
+    // Create a temporary row with an input field
+    const table = $("contactsTable");
+    const newRow = document.createElement("div");
+    newRow.className = "contacts-row";
+    newRow.innerHTML = `
+      <div class="c-type" style="color:var(--ink-faint)">?</div>
+      <div class="c-contact" style="padding:2px;">
+        <input type="text" class="contact-add-input" placeholder="输入邮箱/网址/号码，自动识别类型…" />
+      </div>
+      <div class="c-name"></div>
+      <div class="c-status">Active</div>
+      <div class="c-comlast">2000-01-01</div>
+      <div class="c-comrecords">0r0</div>
+      <div class="c-del" title="取消">×</div>
+    `;
+    table.appendChild(newRow);
+    const input = newRow.querySelector(".contact-add-input");
+    const typeCell = newRow.querySelector(".c-type");
+    input.focus();
+
+    const commit = () => {
+      const val = input.value.trim();
+      if (!val) {
+        newRow.remove();
+        return;
+      }
+      // V2: auto-detect type from content
+      const detected = detectContactType(val);
+      // Map detected type to config type list
+      let typeStr = "Others";
+      if (detected === "Email") typeStr = "Email";
+      else if (detected === "Website") typeStr = "Website";
+      else if (detected === "Phone") typeStr = "Phone";
+      else if (detected === "WhatsApp") typeStr = "WhatsApp";
+
+      // If the detected type isn't in the config list, add "Others"
+      if (!state.config.contactTypeList.includes(typeStr)) {
+        typeStr = state.config.contactTypeList[0] || "Email";
+      }
+
+      c._contacts.push({
+        Type: typeStr,
+        Contact: storeContactValue(val),
+        Name: "new_name",
+        Status: "Active",
+        Com_Last: "2000-01-01",
+        Com_Records: "0r0",
+      });
+      syncContactsToCustomer(c);
+      state.dirty = true;
+      renderDetail();
+      toast(`已添加联系方式，自动识别类型：${detected}`, "success");
+    };
+
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); commit(); }
+      if (e.key === "Escape") { newRow.remove(); }
+    });
+    input.addEventListener("blur", () => {
+      // small delay to allow Enter to process
+      setTimeout(() => {
+        if (document.body.contains(newRow)) commit();
+      }, 100);
+    });
+    // Live preview of detected type
+    input.addEventListener("input", () => {
+      const val = input.value.trim();
+      if (val) {
+        const detected = detectContactType(val);
+        const cls = typeBadgeClass(detected);
+        typeCell.innerHTML = `<span class="c-type-badge ${cls}">${typeBadgeLetter(detected)}</span> <span style="font-size:10px;color:var(--ink-faint)">${detected}</span>`;
+      } else {
+        typeCell.textContent = "?";
+        typeCell.style.color = "var(--ink-faint)";
+      }
+    });
+    // Cancel button
+    newRow.querySelector(".c-del").addEventListener("click", () => newRow.remove());
+  }
+
+  /* ============================================================
+     V2: Inline edit for Contact (with auto-type re-detection on commit)
+     ============================================================ */
+  function inlineEditContact(el, ct, onDone) {
+    const oldVal = ct.Contact;
+    const wrap = el.querySelector(".c-contact-wrap") || el;
+    const input = document.createElement("input");
+    input.type = "text";
+    input.value = oldVal;
+    input.className = "contact-add-input";
+    el.innerHTML = "";
+    el.appendChild(input);
+    input.focus();
+    input.select();
+    const commit = () => {
+      ct.Contact = storeContactValue(input.value.trim() || oldVal);
+      onDone();
+    };
+    input.addEventListener("blur", commit);
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") input.blur();
+      if (e.key === "Escape") { input.value = oldVal; input.blur(); }
+    });
+  }
+
   function inlineEdit(el, obj, field, onDone) {
     const oldVal = obj[field];
     const input = document.createElement("input");
@@ -864,7 +1576,7 @@
   }
 
   /* ============================================================
-     SAVE CURRENT CUSTOMER (with duplicate check on new)
+     SAVE CURRENT CUSTOMER
      ============================================================ */
   function saveCurrentCustomer() {
     if (state.currentIdx < 0) {
@@ -872,13 +1584,10 @@
       return;
     }
     const c = state.customers[state.currentIdx];
-    // ensure ID
     if (!c.ID || String(c.ID).trim() === "") {
       c.ID = genId() + " " + (c.Region || "未知地区") + " " + (c.Category || "未知品类") + " " + (c.Company || "未知公司");
     }
     syncContactsToCustomer(c);
-
-    // Check duplicates for Company / Website / contacts if this is a "new" customer (was added via New)
     if (c._isNew) {
       const checks = ["Company", "Website"];
       for (const col of checks) {
@@ -891,7 +1600,6 @@
           }
         }
       }
-      // contacts duplicate
       for (const ct of c._contacts) {
         const dup = state.customers.findIndex((other, i) => i !== state.currentIdx && other._contacts.some(oct => oct.Contact === ct.Contact));
         if (dup >= 0) {
@@ -901,7 +1609,6 @@
       }
       c._isNew = false;
     }
-
     state.dirty = true;
     saveToLocal();
     renderList();
@@ -910,10 +1617,180 @@
   }
 
   /* ============================================================
-     NEW CUSTOMER
+     V3: Region / country detection from free text
      ============================================================ */
-  function newCustomer() {
+  const REGION_ALIASES = {
+    "澳大利亚": ["australia", "australian"],
+    "肯尼亚": ["kenya", "kenyan"],
+    "南非": ["south africa", "south-african"],
+    "美国": ["united states", "usa", "u.s.a", "america", "american"],
+    "新加坡": ["singapore", "singaporean"],
+    "厄瓜多尔": ["ecuador", "ecuadorian"],
+    "巴西": ["brazil", "brazilian"],
+    "印度": ["india", "indian"],
+    "意大利": ["italy", "italian", "italia"],
+    "苏丹": ["sudan"],
+    "俄罗斯": ["russia", "russian"],
+    "墨西哥": ["mexico", "mexican"],
+    "英国": ["united kingdom", "britain", "british", "england"],
+    "阿联酋": ["uae", "united arab emirates", "dubai", "emirates"],
+    "土耳其": ["turkey", "turkish", "türkiye"],
+  };
+
+  function detectRegion(text, regionList) {
+    if (!regionList || !regionList.length) return "";
+    const lower = text.toLowerCase();
+    // 1) Chinese region name appears directly in text
+    for (const r of regionList) {
+      if (r === "全部") continue;
+      if (lower.includes(r.toLowerCase())) return r;
+    }
+    // 2) English alias (word-boundary match to avoid false substrings)
+    for (const r of regionList) {
+      if (r === "全部") continue;
+      const aliases = REGION_ALIASES[r] || [];
+      for (const a of aliases) {
+        const esc = a.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        if (new RegExp("\\b" + esc + "\\b", "i").test(text)) return r;
+      }
+    }
+    return "";
+  }
+
+  /* ============================================================
+     V2.5: Clipboard smart parse — auto-fill new customer
+     ============================================================ */
+  async function parseClipboardForCustomer() {
+    let text = "";
+    try {
+      text = await navigator.clipboard.readText();
+    } catch (e) {
+      return null;
+    }
+    if (!text || !text.trim()) return null;
+
+    const result = { emails: [], phones: [], websites: [], company: "", region: "" };
+
+    // 1. Extract emails
+    const emailRe = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+    result.emails = [...new Set(text.match(emailRe) || [])];
+    let remaining = text.replace(emailRe, " ");
+
+    // 2. Extract URLs with protocol
+    const urlRe = /https?:\/\/[^\s<>"']+/gi;
+    const urlsWithProto = [...new Set(remaining.match(urlRe) || [])];
+    remaining = remaining.replace(urlRe, " ");
+
+    // 3. Extract bare domains
+    const domainRe = /(?:www\.)?[a-zA-Z0-9][-a-zA-Z0-9]*\.[a-zA-Z]{2,}(?:\.[a-zA-Z]{2,})?(?:\/[^\s]*)?/gi;
+    const bareDomains = [...new Set(remaining.match(domainRe) || [])];
+    const filteredDomains = bareDomains.filter(d => {
+      const parts = d.split(".");
+      if (parts.length < 2) return false;
+      const before = parts[0].toLowerCase();
+      if (before === "www") return parts.length >= 3;
+      return before.length >= 2;
+    });
+    remaining = remaining.replace(domainRe, " ");
+    result.websites = [...urlsWithProto, ...filteredDomains];
+
+    // 4. Extract phone numbers
+    const phoneRe = /\+?[\d][\d\s\-()]{5,}\d/g;
+    const rawPhones = remaining.match(phoneRe) || [];
+    result.phones = [...new Set(rawPhones.map(p => p.trim()).filter(p => {
+      const digits = p.replace(/[^\d]/g, "");
+      return digits.length >= 7;
+    }))];
+
+    // 5. Try to find company name
+    let foundCompany = "";
+    const labelRe = /(?:公司名称?|企业名称?|客户|公司|Company\s*Name|Company|企业|Firm|Business)\s*[:：]\s*([^\n\r]+)/i;
+    const labelMatch = text.match(labelRe);
+    if (labelMatch) {
+      let v = labelMatch[1].replace(/\s+/g, " ").trim();
+      v = v.split(/\s[-–—|]\s|\s*(?:电话|手机|邮箱|Email|Phone|Tel|Address|地址|Website|网址|WhatsApp)\s*[:：]/i)[0].trim();
+      if (v.length > 0 && v.length < 120) foundCompany = v;
+    }
+    if (!foundCompany) {
+      const lines = text.split(/[\n\r]/).map(l => l.trim()).filter(Boolean);
+      for (const line of lines) {
+        if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(line)) continue;
+        if (/^https?:\/\//i.test(line)) continue;
+        if (/^[\d\s\-+()]+$/.test(line)) continue;
+        if (/(Ltd\.?|LLC|Inc\.?|Corp\.?|GmbH|S\.A\.|Co\.?,?|Limited|Corporation|Company|Group|集团|有限公司|股份公司|有限责任公司)/i.test(line) && line.length < 120) {
+          foundCompany = line;
+          break;
+        }
+      }
+    }
+    if (!foundCompany) {
+      let domainForCompany = "";
+      if (result.emails.length > 0) {
+        domainForCompany = result.emails[0].split("@")[1] || "";
+      } else if (result.websites.length > 0) {
+        let w = result.websites[0].replace(/^https?:\/\//i, "").replace(/^www\./i, "");
+        domainForCompany = w.split("/")[0] || "";
+      }
+      if (domainForCompany) {
+        const parts = domainForCompany.split(".");
+        let name = parts[0];
+        if (parts.length >= 3 && parts[0].toLowerCase() === "www") name = parts[1];
+        else if (parts.length >= 2) name = parts[parts.length - 2];
+        name = name.replace(/[-_.]/g, " ").trim();
+        if (name && name.length >= 2) {
+          name = name.split(" ").map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
+          foundCompany = name;
+        }
+      }
+    }
+    result.company = foundCompany;
+    result.region = detectRegion(text, state.config.regionList);
+
+    const hasData = result.emails.length > 0 || result.phones.length > 0 ||
+                     result.websites.length > 0 || result.company || result.region;
+    if (!hasData) return null;
+    return result;
+  }
+
+  /* ============================================================
+     NEW CUSTOMER (V2.5 — clipboard auto-fill)
+     ============================================================ */
+  async function newCustomer() {
+    let clipData = null;
+    try {
+      clipData = await parseClipboardForCustomer();
+    } catch (e) { /* ignore clipboard errors */ }
+
     const template = state.currentIdx >= 0 ? state.customers[state.currentIdx] : null;
+    const contacts = [];
+    let company = "";
+    let website = "";
+    let region = "";
+
+    if (clipData) {
+      company = clipData.company;
+      region = clipData.region;
+      if (clipData.websites.length > 0) website = clipData.websites[0];
+      for (const email of clipData.emails) {
+        contacts.push({
+          Type: "Email", Contact: email, Name: "new_name",
+          Status: "Active", Com_Last: "2000-01-01", Com_Records: "0r0",
+        });
+      }
+      for (const phone of clipData.phones) {
+        contacts.push({
+          Type: "Phone", Contact: storeContactValue(phone), Name: "new_name",
+          Status: "Active", Com_Last: "2000-01-01", Com_Records: "0r0",
+        });
+      }
+      for (const w of clipData.websites) {
+        contacts.push({
+          Type: "Website", Contact: w, Name: "new_name",
+          Status: "Active", Com_Last: "2000-01-01", Com_Records: "0r0",
+        });
+      }
+    }
+
     const c = {
       Index: state.customers.length + 1,
       ID: "",
@@ -923,16 +1800,13 @@
       Last: todayStr(),
       Next: todayStr(),
       Address: "",
-      Company: "",
-      Website: "",
+      Company: company,
+      Website: website,
       Category: template ? template.Category : "",
-      Region: template ? template.Region : "",
+      Region: region || (template ? template.Region : ""),
       From: template ? template.From : "",
       Log: "",
-      _contacts: [{
-        Type: "Email", Contact: "new_contact", Name: "new_name",
-        Status: "Active", Com_Last: "2000-01-01", Com_Records: "0r0"
-      }],
+      _contacts: contacts,
       _isNew: true,
     };
     state.customers.push(c);
@@ -941,15 +1815,25 @@
     state.filterPage = state.filteredIdx.length - 1;
     saveToLocal();
     renderAll();
-    toast("已创建新客户，请填写信息后保存", "success");
+
+    if (clipData) {
+      const parts = [];
+      if (company) parts.push(`公司: ${company}`);
+      if (clipData.emails.length) parts.push(`${clipData.emails.length}个邮箱`);
+      if (clipData.phones.length) parts.push(`${clipData.phones.length}个电话`);
+      if (clipData.websites.length) parts.push(`${clipData.websites.length}个网址`);
+      if (region) parts.push(`地区: ${region}`);
+      toast(`已从剪贴板自动填充：${parts.join("，")}`, "success");
+    } else {
+      toast("已创建新客户，请填写信息后保存", "success");
+    }
   }
 
   /* ============================================================
-     BATCH IMPORT (from NewList)
+     BATCH IMPORT
      ============================================================ */
   function batchImport() {
     if (!state._newList || state._newList.length === 0) {
-      // allow user to import a separate file
       const input = document.createElement("input");
       input.type = "file";
       input.accept = ".xlsx,.xls";
@@ -977,7 +1861,6 @@
     for (const row of rows) {
       const c = normalizeCustomer(row, state.customers.length);
       c._isNew = true;
-      // duplicate check
       let isDup = false;
       for (const col of ["Company", "Website"]) {
         const val = c[col];
@@ -1009,11 +1892,9 @@
   }
 
   /* ============================================================
-     BATCH UPDATE (placeholder — operates on ConvertList data)
+     BATCH UPDATE
      ============================================================ */
   function batchUpdate() {
-    // For the web version, batch update = re-apply auto dates to all customers
-    // (since ConvertList workflow was Excel-specific). Provide a useful alternative:
     let updated = 0;
     for (const c of state.customers) {
       const before = c.Next;
@@ -1049,7 +1930,6 @@
     state.currentIdx = n - 1;
     state.filterPage = state.filteredIdx.indexOf(state.currentIdx);
     if (state.filterPage < 0) {
-      // not in filtered set — reset filter
       state.filteredIdx = state.customers.map((_, i) => i);
       state.filterPage = state.currentIdx;
     }
@@ -1064,6 +1944,65 @@
     const body = $("configBody");
     const cfg = state.config;
     body.innerHTML = `
+      <div class="cfg-section">
+        <h4>邮箱服务</h4>
+        <div style="padding:8px 10px;background:rgba(0,0,0,0.2);border-radius:6px;border:1px solid var(--border);font-size:12px;color:var(--ink-dim);line-height:1.6;">
+          当前使用 <b style="color:var(--accent)">mailto 协议</b>（调用系统默认邮件客户端 Foxmail 打开写信窗口）<br>
+          <span style="color:var(--ink-faint)">如需切换默认客户端，请在 Windows 设置 → 应用 → 默认应用 → 邮件 中修改</span>
+        </div>
+      </div>
+      <div class="cfg-section">
+        <h4>自动保存（每30分钟）</h4>
+        <div class="backup-status" id="backupStatus"></div>
+        <div class="backup-actions" id="backupActions"></div>
+      </div>
+
+      <!-- Google Drive 配置 -->
+      <div class="cfg-section" id="googleDriveConfigSection" style="display:none;">
+        <h4>☁️ Google Drive 配置</h4>
+        <div style="padding:10px;background:rgba(30,50,90,0.03);border-radius:6px;border:1px solid var(--border);">
+          <div style="margin-bottom:10px;">
+            <label style="font-weight:700;font-size:12px;color:var(--ink);">Client ID</label>
+            <input type="text" id="googleClientId" class="field-input" placeholder="xxxxxxxxxxxx-xxxxxxxxxxxxxxxxxx.apps.googleusercontent.com" style="margin-top:4px;" />
+          </div>
+          <div style="margin-bottom:10px;">
+            <label style="font-weight:700;font-size:12px;color:var(--ink);">API Key</label>
+            <input type="text" id="googleApiKey" class="field-input" placeholder="AIzaSyXXXXXXXXXXXXXXXXXXXXXXXXX" style="margin-top:4px;" />
+          </div>
+          <div style="font-size:11px;color:var(--ink-dim);line-height:1.6;background:#fff;padding:8px;border-radius:4px;border:1px solid var(--border);">
+            <b style="color:var(--accent);">获取步骤：</b><br>
+            1. 访问 <a href="https://console.cloud.google.com/" target="_blank" style="color:var(--accent);">Google Cloud Console</a><br>
+            2. 创建项目（或选择已有项目）<br>
+            3. 点击「API和服务」→「凭据」→「创建凭据」→「OAuth 客户端 ID」<br>
+            4. 应用类型选择「网页应用」<br>
+            5. 在「已获准的重定向 URI」中添加：<code style="background:rgba(37,99,235,0.1);padding:1px 4px;border-radius:3px;">${window.location.origin}</code><br>
+            6. 复制 Client ID 和 API Key 填入上方
+          </div>
+          <button class="sbtn small" id="saveGoogleConfig" style="margin-top:8px;">保存 Google Drive 配置</button>
+        </div>
+      </div>
+
+      <!-- OneDrive 配置 -->
+      <div class="cfg-section" id="oneDriveConfigSection" style="display:none;">
+        <h4>🔷 OneDrive 配置</h4>
+        <div style="padding:10px;background:rgba(30,50,90,0.03);border-radius:6px;border:1px solid var(--border);">
+          <div style="margin-bottom:10px;">
+            <label style="font-weight:700;font-size:12px;color:var(--ink);">Application (Client) ID</label>
+            <input type="text" id="onedriveClientId" class="field-input" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" style="margin-top:4px;" />
+          </div>
+          <div style="font-size:11px;color:var(--ink-dim);line-height:1.6;background:#fff;padding:8px;border-radius:4px;border:1px solid var(--border);">
+            <b style="color:var(--accent);">获取步骤：</b><br>
+            1. 访问 <a href="https://portal.azure.com/" target="_blank" style="color:var(--accent);">Azure Portal</a><br>
+            2. 点击「Azure Active Directory」→「应用注册」→「新注册」<br>
+            3. 名称填写「Customer Management Web」<br>
+            4. 重定向 URI 选择「Web」，填写：<code style="background:rgba(37,99,235,0.1);padding:1px 4px;border-radius:3px;">${window.location.origin}</code><br>
+            5. 点击「注册」<br>
+            6. 复制「Application (Client) ID」填入上方<br>
+            7. 点击「证书和密码」→「新建客户端密码」→ 设置密码并记录（可选）
+          </div>
+          <button class="sbtn small" id="saveOnedriveConfig" style="margin-top:8px;">保存 OneDrive 配置</button>
+        </div>
+      </div>
       <div class="cfg-section">
         <h4>等级与跟进周期（天）</h4>
         <div id="cfgRating"></div>
@@ -1099,6 +2038,7 @@
         <div class="cfg-add"><input type="text" id="newStatus" placeholder="新状态" /><button class="sbtn small" id="addStatus">添加</button></div>
       </div>
     `;
+
     renderCfgList("cfgRating", cfg.ratingList.filter(r => r !== "全部"), (name) => {
       const off = cfg.ratingOffset[name] || 30;
       return `<div class="cfg-rating-row">
@@ -1113,7 +2053,6 @@
     renderCfgList("cfgType", cfg.contactTypeList);
     renderCfgList("cfgStatus", cfg.contactStatusList);
 
-    // bind adds
     $("addRating").onclick = () => {
       const n = $("newRatingName").value.trim();
       const o = parseInt($("newRatingOffset").value) || 30;
@@ -1131,7 +2070,6 @@
     bindAdd("addType", "newType", "contactTypeList");
     bindAdd("addStatus", "newStatus", "contactStatusList");
 
-    // bind rating edit/remove
     body.querySelectorAll(".cfg-rating-row").forEach(row => {
       const nameInput = row.querySelector(".cfg-rating-name");
       const offInput = row.querySelector(".cfg-rating-offset");
@@ -1157,7 +2095,6 @@
       };
     });
 
-    // bind list removes (for category/region/from/type/status)
     const bindListRm = (containerId, listKey) => {
       $(containerId).querySelectorAll(".cfg-item .rm").forEach(rm => {
         rm.onclick = () => {
@@ -1172,6 +2109,10 @@
     bindListRm("cfgFrom", "fromList");
     bindListRm("cfgType", "contactTypeList");
     bindListRm("cfgStatus", "contactStatusList");
+
+    // V4: cloud storage buttons
+    updateWorkingFolderStatusUI();
+    updateCloudButtons();
 
     $("configModal").hidden = false;
   }
@@ -1215,10 +2156,371 @@
   }
 
   /* ============================================================
+     V4: AUTO-SAVE — File System Access API
+     Working folder: saves Excel every 30 minutes, deletes previous file
+     ============================================================ */
+  function fsaSupported() {
+    return typeof window.showDirectoryPicker === "function";
+  }
+
+  async function pickWorkingFolder() {
+    if (!fsaSupported()) {
+      toast("当前浏览器不支持选择文件夹自动保存（建议用 Chrome/Edge）", "error");
+      return;
+    }
+    try {
+      const handle = await window.showDirectoryPicker({ mode: "readwrite" });
+      workingDirHandle = handle;
+      await idbPut(WORKING_DIR_HANDLE_KEY, handle);
+      toast(`已选择工作文件夹：${handle.name}，每30分钟自动保存一次`, "success");
+      updateWorkingFolderStatusUI();
+    } catch (e) {
+      // user cancelled
+    }
+  }
+
+  async function clearWorkingFolder() {
+    workingDirHandle = null;
+    await idbDel(WORKING_DIR_HANDLE_KEY);
+    currentAutoSaveFileName = "";
+    await idbDel(LAST_SAVE_NAME_KEY);
+    toast("已取消自动保存", "success");
+    updateWorkingFolderStatusUI();
+  }
+
+  async function restoreWorkingFolderHandle() {
+    if (!idb) return;
+    try {
+      const h = await idbGet(WORKING_DIR_HANDLE_KEY);
+      if (h) workingDirHandle = h;
+      const lastFile = await idbGet(LAST_SAVE_NAME_KEY);
+      if (lastFile) currentAutoSaveFileName = lastFile;
+    } catch (e) { /* handle may be stale */ }
+  }
+
+  async function ensureWorkingFolderPermission() {
+    if (!workingDirHandle) return false;
+    let perm = await workingDirHandle.queryPermission({ mode: "readwrite" });
+    if (perm === "granted") return true;
+    try {
+      perm = await workingDirHandle.requestPermission({ mode: "readwrite" });
+    } catch (e) {}
+    return perm === "granted";
+  }
+
+  async function deletePreviousAutoSave() {
+    if (!workingDirHandle || !currentAutoSaveFileName) return;
+    try {
+      await workingDirHandle.removeEntry(currentAutoSaveFileName);
+    } catch (e) {
+      // File may not exist yet, that's fine
+    }
+  }
+
+  async function runAutoSave(silent) {
+    if (!state.dirty && currentAutoSaveFileName) {
+      if (!silent) toast("数据无更新，无需保存", "success");
+      return;
+    }
+
+    // Check if the selected cloud storage is configured
+    if (cloudStorage.provider === "local" && !workingDirHandle) {
+      if (!silent) toast("请先在「配置」中选择工作文件夹", "error");
+      return;
+    }
+    if (cloudStorage.provider === "google" && !cloudStorage.googleToken) {
+      if (!silent) toast("请先在「配置」中登录 Google Drive", "error");
+      return;
+    }
+    if (cloudStorage.provider === "onedrive" && !cloudStorage.onedriveToken) {
+      if (!silent) toast("请先在「配置」中登录 OneDrive", "error");
+      return;
+    }
+
+    try {
+      // Build workbook and save
+      const wb = buildWorkbook();
+      const buf = XLSX.write(wb, { type: "array", bookType: "xlsx" });
+
+      // Generate new filename with timestamp
+      const now = new Date();
+      const ts = now.toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      const newFileName = `客户总表_自动保存_${ts}.xlsx`;
+
+      let success = false;
+      let location = "";
+
+      // Save based on selected cloud provider
+      switch (cloudStorage.provider) {
+        case "local":
+          // Check permission
+          const ok = await ensureWorkingFolderPermission();
+          if (!ok) {
+            if (!silent) toast("工作文件夹权限未授予，请重新选择文件夹", "error");
+            return;
+          }
+          // Delete previous auto-save file first
+          await deletePreviousAutoSave();
+          // Save to local folder
+          const fileHandle = await workingDirHandle.getFileHandle(newFileName, { create: true });
+          const writable = await fileHandle.createWritable();
+          await writable.write(buf);
+          await writable.close();
+          success = true;
+          location = workingDirHandle.name;
+          break;
+
+        case "google":
+          // Delete previous file and upload to Google Drive
+          success = await googleDriveUpload(newFileName, buf);
+          location = "Google Drive";
+          break;
+
+        case "onedrive":
+          // Delete previous file and upload to OneDrive
+          success = await onedriveUpload(newFileName, buf);
+          location = "OneDrive";
+          break;
+      }
+
+      if (success) {
+        // Update tracking state
+        currentAutoSaveFileName = newFileName;
+        await idbPut(LAST_SAVE_NAME_KEY, newFileName);
+
+        state.dirty = false;
+        lastAutoSaveTime = now.toLocaleString();
+        saveToLocal();
+        if (!silent) toast(`已保存到 ${location}/${newFileName}`, "success");
+        updateWorkingFolderStatusUI();
+      }
+    } catch (e) {
+      console.warn("auto save failed", e);
+      if (!silent) toast("保存失败：" + e.message, "error");
+    }
+  }
+
+  function startAutoSaveTimer() {
+    if (autoSaveTimer) clearInterval(autoSaveTimer);
+    autoSaveTimer = setInterval(() => {
+      runAutoSave(true);
+    }, AUTO_SAVE_INTERVAL_MS);
+  }
+
+  function updateWorkingFolderStatusUI() {
+    const el = $("backupStatus");
+    if (!el) return;
+
+    let html = "";
+
+    // Cloud storage selector
+    html += `<div style="margin-bottom:12px;">
+      <label style="font-weight:700;color:var(--ink);font-size:13px;">保存位置：</label>
+      <select id="cloudProviderSelect" style="height:30px;padding:0 8px;border:1px solid var(--border);border-radius:6px;background:#fff;color:var(--ink);font-size:12px;margin-left:8px;">
+        <option value="local" ${cloudStorage.provider === "local" ? "selected" : ""}>📁 本地文件夹</option>
+        <option value="google" ${cloudStorage.provider === "google" ? "selected" : ""}>☁️ Google Drive</option>
+        <option value="onedrive" ${cloudStorage.provider === "onedrive" ? "selected" : ""}>🔷 OneDrive</option>
+      </select>
+    </div>`;
+
+    // Status based on selected provider
+    switch (cloudStorage.provider) {
+      case "local":
+        if (!fsaSupported()) {
+          html += `<span class="bk-warn">当前浏览器不支持自动保存到文件夹，请用「保存导出」手动备份，或换用 Chrome / Edge。</span>`;
+        } else if (workingDirHandle) {
+          html += `工作文件夹：<span class="bk-folder">${escapeHtml(workingDirHandle.name)}</span><br>
+            自动保存文件：<b>客户总表_自动保存_时间戳.xlsx</b>（每次保存前删除旧文件）<br>
+            上次保存：${lastAutoSaveTime ? `<b>${escapeHtml(lastAutoSaveTime)}</b>` : '<span class="bk-warn">尚未保存</span>'}<br>
+            <span style="color:var(--ink-faint)">每30分钟自动检测，有更新才保存。刷新页面后首次保存可能需重新授权。</span>`;
+        } else {
+          html += `<span class="bk-warn">未设置工作文件夹</span><br>点击下方「选择工作文件夹」按钮选择一个目录。`;
+        }
+        break;
+
+      case "google":
+        if (!isGoogleDriveConfigured()) {
+          html += `<span class="bk-warn">Google Drive 未配置</span><br>
+            请在下方「Google Drive 配置」区域填写 Client ID 和 API Key。<br>
+            <span style="color:var(--ink-faint)">点击下方「显示 Google 配置」按钮展开配置区域。</span>`;
+        } else if (cloudStorage.googleToken) {
+          html += `已登录 Google Drive<br>
+            自动保存文件：<b>客户总表_自动保存_时间戳.xlsx</b><br>
+            上次保存：${lastAutoSaveTime ? `<b>${escapeHtml(lastAutoSaveTime)}</b>` : '<span class="bk-warn">尚未保存</span>'}<br>
+            <span style="color:var(--ink-faint)">每30分钟自动检测，有更新才保存。</span>`;
+        } else {
+          html += `<span class="bk-warn">未登录 Google Drive</span><br>点击下方「登录 Google Drive」按钮进行认证。`;
+        }
+        break;
+
+      case "onedrive":
+        if (!isOneDriveConfigured()) {
+          html += `<span class="bk-warn">OneDrive 未配置</span><br>
+            请在下方「OneDrive 配置」区域填写 Client ID。<br>
+            <span style="color:var(--ink-faint)">点击下方「显示 OneDrive 配置」按钮展开配置区域。</span>`;
+        } else if (cloudStorage.onedriveToken) {
+          html += `已登录 OneDrive<br>
+            自动保存文件：<b>客户总表_自动保存_时间戳.xlsx</b><br>
+            上次保存：${lastAutoSaveTime ? `<b>${escapeHtml(lastAutoSaveTime)}</b>` : '<span class="bk-warn">尚未保存</span>'}<br>
+            <span style="color:var(--ink-faint)">每30分钟自动检测，有更新才保存。</span>`;
+        } else {
+          html += `<span class="bk-warn">未登录 OneDrive</span><br>点击下方「登录 OneDrive」按钮进行认证。`;
+        }
+        break;
+    }
+
+    el.innerHTML = html;
+
+    // Show/hide config sections based on provider
+    const googleSection = $("googleDriveConfigSection");
+    const onedriveSection = $("oneDriveConfigSection");
+    if (googleSection) googleSection.style.display = cloudStorage.provider === "google" ? "block" : "none";
+    if (onedriveSection) onedriveSection.style.display = cloudStorage.provider === "onedrive" ? "block" : "none";
+
+    // Bind cloud provider selector
+    const providerSelect = $("cloudProviderSelect");
+    if (providerSelect) {
+      providerSelect.addEventListener("change", async () => {
+        cloudStorage.provider = providerSelect.value;
+        await saveCloudStorageState();
+        updateWorkingFolderStatusUI();
+        updateCloudButtons();
+      });
+    }
+
+    // Bind config save buttons
+    const saveGoogleBtn = $("saveGoogleConfig");
+    const saveOnedriveBtn = $("saveOnedriveConfig");
+    if (saveGoogleBtn) {
+      saveGoogleBtn.addEventListener("click", async () => {
+        googleDriveConfig.clientId = $("googleClientId").value.trim();
+        googleDriveConfig.apiKey = $("googleApiKey").value.trim();
+        await idbPut(GOOGLE_CONFIG_KEY, googleDriveConfig);
+        toast("Google Drive 配置已保存", "success");
+        updateWorkingFolderStatusUI();
+        updateCloudButtons();
+      });
+    }
+    if (saveOnedriveBtn) {
+      saveOnedriveBtn.addEventListener("click", async () => {
+        onedriveConfig.clientId = $("onedriveClientId").value.trim();
+        await idbPut(ONEDRIVE_CONFIG_KEY, onedriveConfig);
+        toast("OneDrive 配置已保存", "success");
+        updateWorkingFolderStatusUI();
+        updateCloudButtons();
+      });
+    }
+
+    // Populate config inputs with saved values
+    const googleClientIdInput = $("googleClientId");
+    const googleApiKeyInput = $("googleApiKey");
+    const onedriveClientIdInput = $("onedriveClientId");
+    if (googleClientIdInput) googleClientIdInput.value = googleDriveConfig.clientId || "";
+    if (googleApiKeyInput) googleApiKeyInput.value = googleDriveConfig.apiKey || "";
+    if (onedriveClientIdInput) onedriveClientIdInput.value = onedriveConfig.clientId || "";
+  }
+
+  function updateCloudButtons() {
+    const actionsEl = $("backupActions");
+    if (!actionsEl) return;
+
+    let buttonsHtml = "";
+
+    switch (cloudStorage.provider) {
+      case "local":
+        buttonsHtml = `
+          <button class="sbtn small" id="btnPickBackup">选择工作文件夹</button>
+          <button class="sbtn small success" id="btnBackupNow">立即保存</button>
+          <button class="sbtn small ghost" id="btnClearBackup">取消自动保存</button>
+        `;
+        break;
+
+      case "google":
+        if (cloudStorage.googleToken) {
+          buttonsHtml = `
+            <button class="sbtn small success" id="btnBackupNow">立即保存</button>
+            <button class="sbtn small ghost" id="btnClearBackup">退出登录</button>
+          `;
+        } else {
+          buttonsHtml = `
+            <button class="sbtn small" id="btnGoogleLogin">登录 Google Drive</button>
+          `;
+        }
+        break;
+
+      case "onedrive":
+        if (cloudStorage.onedriveToken) {
+          buttonsHtml = `
+            <button class="sbtn small success" id="btnBackupNow">立即保存</button>
+            <button class="sbtn small ghost" id="btnClearBackup">退出登录</button>
+          `;
+        } else {
+          buttonsHtml = `
+            <button class="sbtn small" id="btnOneDriveLogin">登录 OneDrive</button>
+          `;
+        }
+        break;
+    }
+
+    actionsEl.innerHTML = buttonsHtml;
+
+    // Bind button events
+    const btnPick = $("btnPickBackup");
+    const btnNow = $("btnBackupNow");
+    const btnClear = $("btnClearBackup");
+    const btnGoogleLogin = $("btnGoogleLogin");
+    const btnOneDriveLogin = $("btnOneDriveLogin");
+
+    if (btnPick) btnPick.onclick = () => pickWorkingFolder();
+    if (btnNow) btnNow.onclick = () => runAutoSave(false);
+    if (btnClear) btnClear.onclick = () => clearCloudStorage();
+    if (btnGoogleLogin) btnGoogleLogin.onclick = async () => {
+      const success = await authenticateGoogleDrive();
+      if (success) {
+        updateWorkingFolderStatusUI();
+        updateCloudButtons();
+      }
+    };
+    if (btnOneDriveLogin) btnOneDriveLogin.onclick = async () => {
+      const success = await authenticateOneDrive();
+      if (success) {
+        updateWorkingFolderStatusUI();
+        updateCloudButtons();
+      }
+    };
+  }
+
+  async function clearCloudStorage() {
+    if (cloudStorage.provider === "local") {
+      workingDirHandle = null;
+      await idbDel(WORKING_DIR_HANDLE_KEY);
+      currentAutoSaveFileName = "";
+      await idbDel(LAST_SAVE_NAME_KEY);
+      toast("已取消自动保存", "success");
+    } else if (cloudStorage.provider === "google") {
+      cloudStorage.googleToken = null;
+      await idbDel(GOOGLE_DRIVE_TOKEN_KEY);
+      toast("已退出 Google Drive", "success");
+    } else if (cloudStorage.provider === "onedrive") {
+      cloudStorage.onedriveToken = null;
+      await idbDel(ONEDRIVE_TOKEN_KEY);
+      if (msalInstance) {
+        msalInstance.logoutPopup();
+      }
+      toast("已退出 OneDrive", "success");
+    }
+    currentAutoSaveFileName = "";
+    updateWorkingFolderStatusUI();
+    updateCloudButtons();
+  }
+
+  /* ============================================================
      INIT & EVENT WIRING
      ============================================================ */
-  function init() {
-    // Buttons
+  async function init() {
+    // V4: open IndexedDB first
+    try { await idbOpen(); } catch (e) { console.warn("IDB open failed", e); }
+
     $("btnOpen").addEventListener("click", () => $("fileInput").click());
     $("fileInput").addEventListener("change", (e) => {
       if (e.target.files[0]) importExcel(e.target.files[0]);
@@ -1228,6 +2530,7 @@
     $("btnImport").addEventListener("click", batchImport);
     $("btnNew").addEventListener("click", newCustomer);
     $("btnBatchUpdate").addEventListener("click", batchUpdate);
+    $("btnExportConvert").addEventListener("click", exportToConvertList);
     $("btnConfig").addEventListener("click", openConfig);
 
     $("btnSearch").addEventListener("click", applyFilter);
@@ -1273,8 +2576,7 @@
       if (e.key === "s" && e.ctrlKey) { e.preventDefault(); saveCurrentCustomer(); }
     });
 
-    // Try load from localStorage
-    if (loadFromLocal()) {
+    if (await loadFromLocal()) {
       renderAll();
       toast(`已从本地恢复 ${state.customers.length} 条客户数据`, "success");
     } else {
@@ -1282,9 +2584,17 @@
       updateStats();
     }
 
-    // Auto-save on unload
+    // V4: restore working folder handle + start 30-min timer
+    await restoreWorkingFolderHandle();
+    await loadCloudStorageState();
+    startAutoSaveTimer();
+
     window.addEventListener("beforeunload", () => {
-      if (state.dirty) saveToLocal();
+      if (state.dirty) {
+        saveToLocal();
+        // best-effort auto-save on unload
+        runAutoSave(true);
+      }
     });
   }
 
