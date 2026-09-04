@@ -432,12 +432,6 @@
       }
     }
   }
-    } catch (e) {
-      console.error("Google Drive auth failed", e);
-      toast("Google Drive 认证失败: " + e.message, "error");
-      return false;
-    }
-  }
 
   // Check if token is expired
   function isTokenExpired(token) {
