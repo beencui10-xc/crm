@@ -121,7 +121,9 @@
     $m("mPageDetail").hidden = v !== "detail";
     $m("mPageContacts").hidden = v !== "contacts";
     renderCurrent();
-    window.scrollTo(0, 0);
+    // scroll lives inside the page pane now (fixed app shell) — reset it
+    const sc = $m(v === "list" ? "mList" : v === "detail" ? "mDetailBody" : "mContactsBody");
+    if (sc) sc.scrollTop = 0;
   }
   function renderCurrent() {
     if (!api) return;

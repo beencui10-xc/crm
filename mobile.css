@@ -12,23 +12,34 @@ body.m-active #workspace {
 }
 body.m-active {
   overscroll-behavior-y: contain;
+  overflow: hidden !important;   /* scroll happens inside .m-page panes, not the document */
+  height: 100%;
 }
+html:has(body.m-active) { overflow: hidden; }
 
-/* ---- root container ---- */
+/* ---- root container: fixed app shell (native-app style scrolling) ---- */
 #mApp {
   font-family: inherit;
   color: #2a3040;
-  min-height: 100vh;
-  min-height: 100dvh;
+  position: fixed; inset: 0;
+  z-index: 50;
+  display: flex; flex-direction: column;
+  overflow: hidden;
+  touch-action: manipulation;    /* no double-tap-zoom delay */
   background: #f2f4fa;
-  padding-bottom: calc(16px + env(safe-area-inset-bottom, 0px));
 }
-.m-page { animation: mFadeIn 0.18s ease; }
+#mApp[hidden] { display: none !important; }
+.m-page {
+  display: flex; flex-direction: column;
+  flex: 1; min-height: 0; height: 100%;
+  animation: mFadeIn 0.18s ease;
+}
+.m-page[hidden] { display: none; }   /* display:flex above would beat [hidden] otherwise */
 @keyframes mFadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 
 /* ---- top bar ---- */
 .m-topbar {
-  position: sticky; top: 0; z-index: 20;
+  position: relative; z-index: 20; flex-shrink: 0;
   display: flex; align-items: center; gap: 10px;
   padding: calc(10px + env(safe-area-inset-top, 0px)) 14px 10px;
   background: rgba(255,255,255,0.92);
@@ -74,7 +85,11 @@ body.m-active {
 .m-chip.warn.active { background: #e08a3c; border-color: #e08a3c; }
 
 /* ---- customer cards ---- */
-.m-list { padding: 8px 14px; }
+.m-list {
+  flex: 1; min-height: 0; overflow-y: auto;
+  -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
+  padding: 8px 14px calc(16px + env(safe-area-inset-bottom, 0px));
+}
 .m-card {
   background: #fff; border: 1px solid #e7eaf4; border-radius: 14px;
   padding: 14px; margin-bottom: 10px;
@@ -107,7 +122,11 @@ body.m-active {
 .m-empty small { font-size: 12px; color: #a5adc0; }
 
 /* ---- detail page ---- */
-.m-detail, .m-contacts { padding: 12px 14px; }
+.m-detail, .m-contacts {
+  flex: 1; min-height: 0; overflow-y: auto;
+  -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
+  padding: 12px 14px calc(16px + env(safe-area-inset-bottom, 0px));
+}
 .m-sec-title {
   font-size: 13px; font-weight: 700; color: #8a92a6;
   margin-bottom: 10px; display: flex; align-items: center; justify-content: space-between;
@@ -139,7 +158,7 @@ body.m-active {
 .m-arrow { color: #a5adc0; font-size: 22px; line-height: 1; }
 .m-log {
   font-size: 13px; line-height: 1.7; white-space: pre-wrap; word-break: break-word;
-  color: #444c60; max-height: 40vh; overflow-y: auto;
+  color: #444c60; max-height: 40vh; overflow-y: auto; overscroll-behavior: contain;
 }
 
 /* ---- contacts page ---- */
@@ -174,6 +193,9 @@ body.m-active {
   background: rgba(20, 26, 46, 0.45);
   display: flex; align-items: flex-end;
 }
+/* CRITICAL: display:flex above beats the UA [hidden] rule — without this,
+   an invisible full-screen overlay blocks every tap on the page */
+.m-sheet-backdrop[hidden] { display: none !important; }
 .m-sheet {
   width: 100%; background: #fff;
   border-radius: 18px 18px 0 0;
@@ -197,7 +219,7 @@ body.m-active {
 .m-btn-row.sheet { margin-top: 16px; }
 
 /* ---- config modal fits phone (reuses desktop modal) ---- */
-body.m-active .modal-backdrop { padding: 0; }
+body.m-active .modal-backdrop { padding: 0; z-index: 300; }
 body.m-active .modal, body.m-active .modal.modal-lg {
   width: 94vw; max-width: 94vw; max-height: 86vh;
   border-radius: 16px;
