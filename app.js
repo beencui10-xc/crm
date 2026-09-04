@@ -401,9 +401,21 @@
     }
   }
 
+  // Check if token is expired
+  function isTokenExpired(token) {
+    if (!token || !token.expires_at) return true;
+    return Date.now() >= token.expires_at - 300000; // 5 min buffer
+  }
+
   async function googleDriveUpload(fileName, data) {
     if (!cloudStorage.googleToken || !cloudStorage.googleToken.access_token) {
-      toast("请先登录 Google Drive", "error");
+      console.log("Google Drive token not found");
+      return false;
+    }
+
+    if (isTokenExpired(cloudStorage.googleToken)) {
+      console.log("Google Drive token expired");
+      toast("Google Drive token 已过期，请重新登录", "error");
       return false;
     }
 
@@ -438,16 +450,18 @@
       });
 
       if (!response.ok) {
-        throw new Error(`Upload failed: ${response.statusText}`);
+        const errorText = await response.text();
+        console.error("Google Drive upload error:", response.status, errorText);
+        throw new Error(`Upload failed: ${response.status} ${response.statusText}`);
       }
 
       const result = await response.json();
+      console.log("Google Drive upload success:", result.id, result.name);
       currentAutoSaveFileName = fileName;
       await idbPut(LAST_SAVE_NAME_KEY, fileName);
       return true;
     } catch (e) {
-      console.error("Google Drive upload failed", e);
-      toast("Google Drive 上传失败: " + e.message, "error");
+      console.error("Google Drive upload failed:", e);
       return false;
     }
   }
@@ -456,14 +470,9 @@
     if (!cloudStorage.googleToken || !cloudStorage.googleToken.access_token) return;
 
     try {
-      // Search for the file by name
-      let query = `name='${fileName}' and trashed=false`;
-      if (cloudStorage.googleFolderId) {
-        query += ` and '${cloudStorage.googleFolderId}' in parents`;
-      }
-
+      // Search for the file by name - use simple query without special characters
       const searchResponse = await fetch(
-        `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id)`,
+        `https://www.googleapis.com/drive/v3/files?q=name%3D%27${encodeURIComponent(fileName)}%27&fields=files(id)`,
         {
           headers: {
             "Authorization": `Bearer ${cloudStorage.googleToken.access_token}`,
@@ -474,7 +483,6 @@
       if (searchResponse.ok) {
         const result = await searchResponse.json();
         if (result.files && result.files.length > 0) {
-          // Delete all matching files
           for (const file of result.files) {
             await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}`, {
               method: "DELETE",
@@ -482,11 +490,12 @@
                 "Authorization": `Bearer ${cloudStorage.googleToken.access_token}`,
               },
             });
+            console.log("Deleted Google Drive file:", file.name);
           }
         }
       }
     } catch (e) {
-      console.warn("Google Drive delete failed (non-critical)", e);
+      console.warn("Google Drive delete failed:", e);
     }
   }
 
@@ -2444,8 +2453,8 @@
       }
     }
 
-    // 2. Save to cloud (if configured)
-    if (cloudStorage.provider === "google" && cloudStorage.googleToken) {
+    // 2. Save to cloud (if configured) - always save if token exists
+    if (cloudStorage.googleToken) {
       try {
         // Delete previous cloud file
         if (currentAutoSaveFileName) {
@@ -2460,7 +2469,7 @@
       }
     }
 
-    if (cloudStorage.provider === "onedrive" && cloudStorage.onedriveToken) {
+    if (cloudStorage.onedriveToken) {
       try {
         // Delete previous cloud file
         if (currentAutoSaveFileName) {
