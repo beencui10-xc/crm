@@ -3,8 +3,9 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>客户跟进管理系统 V4 | Customer Follow-up Management</title>
-    <meta name="description" content="客户信息登记、跟进记录、批量处理的网页版管理系统 V4（浅色主题）" />
+    <title>客户跟进管理系统 V5 | Customer Follow-up Management</title>
+    <meta name="description" content="客户信息登记、跟进记录、批量处理的网页版管理系统 V5（浅色主题，Google Sheets 云同步）" />
+    <link rel="icon" href="data:," />
     <link rel="stylesheet" href="styles.css" />
     <script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
   </head>
@@ -32,7 +33,7 @@
           </svg>
         </div>
         <div class="brand-text">
-          <span class="brand-name">客户跟进管理 V4</span>
+          <span class="brand-name">客户跟进管理 V5</span>
           <span class="brand-sub">Customer Follow-up Management System</span>
         </div>
       </div>
@@ -81,6 +82,7 @@
         <span class="stat-label">待跟进</span>
         <strong id="statFollowup">0</strong>
       </div>
+      <div class="stat-pill" id="cloudSyncStatus" style="font-size:11px;color:var(--ink-faint);">☁️ 云库未连接</div>
       <div class="stat-pill" id="ratingBreakdown"></div>
       <div class="stat-pill right" id="lastSaved">未加载数据</div>
     </div>

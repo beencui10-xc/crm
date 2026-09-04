@@ -1,10 +1,10 @@
 /* ============================================================
-   Customer Follow-up Management System — Web Edition V4
-   Changes from V3:
-   1. Working folder setting for auto-save
-   2. Auto-save every 30 minutes (instead of 1 hour)
-   3. Delete previous auto-save file after saving new one
-   4. Multi-cloud support: Local / Google Drive / OneDrive
+   Customer Follow-up Management System — Web Edition V5
+   Changes from V4:
+   1. Google Sheets as the primary cloud database (方案 B)
+   2. Auto-sync: 4s debounce after any edit + 10min fallback + on-unload
+   3. Cloud keeps a single live spreadsheet (one spreadsheet, latest data)
+   4. Read data back from Google Sheets on open / page load when configured
    ============================================================ */
 
 (function () {
@@ -56,6 +56,14 @@
   const GOOGLE_CONFIG_KEY = "google_drive_config";
   const ONEDRIVE_CONFIG_KEY = "onedrive_config";
 
+  /* V5 — Google Sheets cloud database */
+  const GOOGLE_SHEET_ID_KEY = "cfms_google_sheet_id_v5";
+  const GOOGLE_SHEET_TITLE = "客户跟进云数据库";
+  const GOOGLE_SHEET_TABS = ["Sheet1", "config", "NewList", "ConvertList"];
+  const CLOUD_SAVE_DEBOUNCE_MS = 4000;   // 4s after last edit
+  const CLOUD_SAVE_FALLBACK_MS = 10 * 60 * 1000; // 10 min safety net
+  const SHEETS_API_BASE = "https://sheets.googleapis.com/v4/spreadsheets";
+
   // Cloud storage provider configuration
   const CLOUD_CONFIG = {
     local: { name: "本地文件夹", icon: "📁" },
@@ -81,6 +89,14 @@
   let onedriveConfig = {
     clientId: "",
   };
+
+  /* V5 — Google Sheets sync state */
+  let cloudSheetId = null;      // spreadsheet id of the cloud DB
+  let cloudSaveTimer = null;    // debounce timer
+  let cloudSaveBusy = false;    // prevent overlapping writes
+  let cloudSavePending = false; // re-schedule if edits arrived mid-save
+  let lastCloudSyncTime = "";   // display string
+  let cloudFallbackTimer = null; // 10-min safety net
 
   // Google Drive API config
   const GOOGLE_SCOPES = ["https://www.googleapis.com/auth/drive.file"];
@@ -161,6 +177,9 @@
       if (onedriveCfg) {
         onedriveConfig.clientId = onedriveCfg.clientId || "";
       }
+      // V5: restore cloud spreadsheet id
+      const sheetId = await idbGet(GOOGLE_SHEET_ID_KEY);
+      if (sheetId) cloudSheetId = sheetId;
     } catch (e) {
       console.warn("Failed to load cloud storage state", e);
     }
@@ -1190,6 +1209,307 @@
   }
 
   /* ============================================================
+     V5 — GOOGLE SHEETS CLOUD DATABASE
+     Data layout mirrors the .xlsx workbook:
+       Sheet1     = customers (header = CUSTOMER_COLUMNS, one row each)
+       config     = same header style parseConfigSheet() understands
+       NewList    = header CUSTOMER_COLUMNS + pending batch rows
+       ConvertList= convHeaders + exported contact rows
+     ============================================================ */
+
+  function markDirty() {
+    state.dirty = true;
+    scheduleCloudSave();
+  }
+
+  function cloudEnabled() {
+    return !!(cloudStorage.googleToken && cloudStorage.googleToken.access_token && !isTokenExpired(cloudStorage.googleToken));
+  }
+
+  // ---------- row serialization ----------
+  function customersToAoa() {
+    const rows = [CUSTOMER_COLUMNS.slice()];
+    state.customers.forEach((c, i) => {
+      const row = CUSTOMER_COLUMNS.map(col => {
+        if (col === "Index") return i + 1;
+        const v = c[col];
+        return v == null ? "" : String(v);
+      });
+      rows.push(row);
+    });
+    return rows;
+  }
+
+  function configToAoa() {
+    const cfg = state.config;
+    const cfgMax = Math.max(
+      cfg.ratingList.length, cfg.categoryList.length, cfg.regionList.length,
+      cfg.fromList.length, cfg.contactTypeList.length, cfg.contactStatusList.length
+    );
+    const headers = ["Row_number", "Rating_cfg", "offset_value", "Category_cfg", "Region_cfg",
+      "From_cfg", "Contact_Type_cfg", "Contact_Status_cfg", "Customer_Basic_column", "Contact_Basic_column"];
+    const rows = [headers];
+    for (let i = 0; i < cfgMax; i++) {
+      rows.push([
+        i + 1,
+        cfg.ratingList[i] || "",
+        cfg.ratingOffset[cfg.ratingList[i]] != null ? cfg.ratingOffset[cfg.ratingList[i]] : "",
+        cfg.categoryList[i] || "",
+        cfg.regionList[i] || "",
+        cfg.fromList[i] || "",
+        cfg.contactTypeList[i] || "",
+        cfg.contactStatusList[i] || "",
+        CUSTOMER_COLUMNS[i] || "",
+        CONTACT_COLUMNS[i] || "",
+      ]);
+    }
+    return rows;
+  }
+
+  function newListToAoa() {
+    const rows = [CUSTOMER_COLUMNS.slice()];
+    (state._newList || []).forEach(obj => {
+      rows.push(CUSTOMER_COLUMNS.map(col => {
+        const v = obj[col];
+        return v == null ? "" : String(v);
+      }));
+    });
+    return rows;
+  }
+
+  function convertListToAoa() {
+    const convHeaders = [...CONTACT_COLUMNS, ...CUSTOMER_COLUMNS.filter(c => c !== "Contacts")];
+    const rows = [convHeaders];
+    (state._convertList || []).forEach(obj => {
+      if (Array.isArray(obj)) {
+        rows.push(convHeaders.map((_, idx) => obj[idx] != null ? String(obj[idx]) : ""));
+      } else {
+        rows.push(convHeaders.map(h => {
+          const v = obj[h];
+          return v == null ? "" : String(v);
+        }));
+      }
+    });
+    return rows;
+  }
+
+  // ---------- row parsing ----------
+  function parseCustomersFromAoa(aoa) {
+    if (!aoa || aoa.length < 2) return [];
+    const headers = aoa[0];
+    return aoa.slice(1)
+      .filter(r => r && r.some(v => v != null && String(v).trim() !== ""))
+      .map((r, idx) => {
+        const obj = {};
+        headers.forEach((h, i) => { obj[h] = r[i] != null ? r[i] : ""; });
+        return normalizeCustomer(obj, idx);
+      });
+  }
+
+  function aoaToObjects(aoa) {
+    if (!aoa || aoa.length < 2) return [];
+    const headers = aoa[0];
+    return aoa.slice(1)
+      .filter(r => r && r.some(v => v != null && String(v).trim() !== ""))
+      .map(r => {
+        const o = {};
+        headers.forEach((h, i) => { o[h] = r[i] != null ? r[i] : ""; });
+        return o;
+      });
+  }
+
+  // ---------- Sheets API helpers ----------
+  async function sheetsReadRange(sheetId, tab) {
+    const url = `${SHEETS_API_BASE}/${encodeURIComponent(sheetId)}/values/${encodeURIComponent(tab + "!A1:ZZ5000")}?valueRenderOption=FORMATTED_VALUE&majorDimension=ROWS`;
+    const resp = await fetch(url, { headers: { "Authorization": `Bearer ${cloudStorage.googleToken.access_token}` } });
+    if (!resp.ok) throw new Error("read " + tab + " failed: " + resp.status);
+    const data = await resp.json();
+    return data.values || [];
+  }
+
+  async function sheetsClearRange(sheetId, tab) {
+    const url = `${SHEETS_API_BASE}/${encodeURIComponent(sheetId)}/values/${encodeURIComponent(tab + "!A1:ZZ5000")}:clear`;
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${cloudStorage.googleToken.access_token}`, "Content-Type": "application/json" },
+      body: "{}",
+    });
+    if (!resp.ok) throw new Error("clear " + tab + " failed: " + resp.status);
+  }
+
+  async function sheetsWriteValues(sheetId, tab, rows) {
+    const range = tab + "!A1";
+    const url = `${SHEETS_API_BASE}/${encodeURIComponent(sheetId)}/values/${encodeURIComponent(range)}?valueInputOption=RAW`;
+    const resp = await fetch(url, {
+      method: "PUT",
+      headers: { "Authorization": `Bearer ${cloudStorage.googleToken.access_token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ range, majorDimension: "ROWS", values: rows }),
+    });
+    if (!resp.ok) throw new Error("write " + tab + " failed: " + resp.status);
+  }
+
+  // Find-or-create the single cloud spreadsheet used as the primary store.
+  async function ensureCloudSpreadsheet() {
+    if (cloudSheetId) return cloudSheetId;
+    if (!cloudStorage.googleToken || !cloudStorage.googleToken.access_token) return null;
+    const token = cloudStorage.googleToken.access_token;
+
+    try {
+      // 1) search Drive for an existing spreadsheet with our title
+      const q = `name='${GOOGLE_SHEET_TITLE.replace(/'/g, "\\'")}' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false`;
+      const listResp = await fetch(
+        `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=files(id,name,createdTime)&orderBy=createdTime asc`,
+        { headers: { "Authorization": `Bearer ${token}` } }
+      );
+      if (listResp.ok) {
+        const listData = await listResp.json();
+        if (listData.files && listData.files.length > 0) {
+          cloudSheetId = listData.files[0].id;
+          await idbPut(GOOGLE_SHEET_ID_KEY, cloudSheetId);
+          return cloudSheetId;
+        }
+      }
+
+      // 2) none found -> create
+      const createBody = {
+        properties: { title: GOOGLE_SHEET_TITLE },
+        sheets: GOOGLE_SHEET_TABS.map(t => ({ properties: { title: t } })),
+      };
+      const createResp = await fetch(SHEETS_API_BASE, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify(createBody),
+      });
+      if (!createResp.ok) throw new Error("create spreadsheet failed: " + createResp.status);
+      const data = await createResp.json();
+      cloudSheetId = data.spreadsheetId;
+      await idbPut(GOOGLE_SHEET_ID_KEY, cloudSheetId);
+      console.log("Created cloud spreadsheet:", cloudSheetId);
+      return cloudSheetId;
+    } catch (e) {
+      console.error("ensureCloudSpreadsheet error:", e);
+      toast("无法创建/查找云库: " + e.message, "error");
+      return null;
+    }
+  }
+
+  // Push the whole in-memory state to the cloud spreadsheet (only latest).
+  async function cloudPushData(silent) {
+    if (!cloudEnabled()) {
+      if (!silent) toast("请先登录 Google 云端", "error");
+      return false;
+    }
+    if (cloudSaveBusy) { cloudSavePending = true; return false; }
+    cloudSaveBusy = true;
+    try {
+      const sheetId = await ensureCloudSpreadsheet();
+      if (!sheetId) return false;
+
+      const payload = {
+        Sheet1: customersToAoa(),
+        config: configToAoa(),
+        NewList: newListToAoa(),
+        ConvertList: convertListToAoa(),
+      };
+
+      let ok = true;
+      for (const tab of GOOGLE_SHEET_TABS) {
+        try {
+          await sheetsClearRange(sheetId, tab);
+          await sheetsWriteValues(sheetId, tab, payload[tab]);
+        } catch (e) {
+          console.error(`cloud write ${tab} failed:`, e);
+          ok = false;
+        }
+      }
+
+      if (ok) {
+        state.dirty = false;
+        lastCloudSyncTime = new Date().toLocaleString();
+        saveToLocal();
+        updateCloudSyncUI();
+        if (!silent) toast("已同步到 Google Sheets 云库", "success");
+      } else if (!silent) {
+        toast("云库同步失败，稍后自动重试", "error");
+      }
+      return ok;
+    } finally {
+      cloudSaveBusy = false;
+      if (cloudSavePending) { cloudSavePending = false; scheduleCloudSave(); }
+    }
+  }
+
+  // Pull everything back from the cloud spreadsheet and rebuild the UI.
+  async function cloudPullData(silent) {
+    if (!cloudEnabled()) {
+      if (!silent) toast("请先登录 Google 云端", "error");
+      return false;
+    }
+    const sheetId = await ensureCloudSpreadsheet();
+    if (!sheetId) return false;
+    try {
+      const customersAoa = await sheetsReadRange(sheetId, "Sheet1");
+      const cfgAoa = await sheetsReadRange(sheetId, "config");
+      const newAoa = await sheetsReadRange(sheetId, "NewList");
+      const convAoa = await sheetsReadRange(sheetId, "ConvertList");
+
+      const cfg = (cfgAoa && cfgAoa.length >= 2) ? parseConfigSheet(cfgAoa) : null;
+      if (cfg) { state.config = cfg; saveConfig(); }
+
+      const customers = parseCustomersFromAoa(customersAoa);
+
+      state.customers = customers;
+      state._newList = aoaToObjects(newAoa);
+      state._convertList = aoaToObjects(convAoa);
+      state.currentIdx = customers.length > 0 ? 0 : -1;
+      state.filteredIdx = customers.map((_, i) => i);
+      state.fileName = "☁️ " + GOOGLE_SHEET_TITLE;
+      state.dirty = false;
+      saveToLocal();
+      populateFilterDropdowns();
+      renderAll();
+      updateStats();
+      lastCloudSyncTime = new Date().toLocaleString();
+      updateCloudSyncUI();
+      if (!silent) toast(`已从云库加载 ${customers.length} 条客户`, "success");
+      return true;
+    } catch (e) {
+      console.error("cloudPullData error:", e);
+      if (!silent) toast("从云库加载失败: " + e.message, "error");
+      return false;
+    }
+  }
+
+  // Debounced auto-save: call after every edit; fires 4s after the last one.
+  function scheduleCloudSave() {
+    if (!cloudEnabled()) return;
+    if (cloudSaveTimer) clearTimeout(cloudSaveTimer);
+    cloudSaveTimer = setTimeout(() => {
+      cloudSaveTimer = null;
+      if (state.dirty) cloudPushData(true);
+    }, CLOUD_SAVE_DEBOUNCE_MS);
+  }
+
+  // 10-minute safety net when edits keep happening (belt & braces).
+  function startCloudFallbackTimer() {
+    if (cloudFallbackTimer) clearInterval(cloudFallbackTimer);
+    cloudFallbackTimer = setInterval(() => {
+      if (cloudEnabled() && state.dirty && !cloudSaveBusy) cloudPushData(true);
+    }, CLOUD_SAVE_FALLBACK_MS);
+  }
+
+  // Small status pill next to "上次保存" in the stats bar.
+  function updateCloudSyncUI() {
+    const el = $("cloudSyncStatus");
+    if (!el) return;
+    const on = cloudEnabled() && cloudSheetId;
+    el.textContent = on
+      ? `☁️ 云库已连接${lastCloudSyncTime ? " · " + lastCloudSyncTime : ""}`
+      : "☁️ 云库未连接";
+    el.style.color = on ? "var(--success, #16a34a)" : "var(--ink-faint, #94a3b8)";
+  }
+
+  /* ============================================================
      SEARCH / FILTER
      ============================================================ */
   function applyFilter() {
@@ -1485,7 +1805,7 @@
         const col = el.dataset.col;
         c[col] = el.value;
         autoSetDates(c);
-        state.dirty = true;
+        markDirty();
         renderList();
       });
     });
@@ -1496,7 +1816,7 @@
         const r = el.dataset.r;
         c.Rating = r;
         autoSetDates(c);
-        state.dirty = true;
+        markDirty();
         renderDetail();
         renderList();
         updateStats();
@@ -1508,7 +1828,7 @@
       el.addEventListener("click", () => {
         const days = parseInt(el.dataset.days);
         c.Next = addDays(todayStr(), days);
-        state.dirty = true;
+        markDirty();
         $("nextDateDisplay").textContent = c.Next;
         document.querySelectorAll(".nq-chip").forEach(x => x.classList.remove("active"));
         el.classList.add("active");
@@ -1548,7 +1868,7 @@
           toast("今日已联系过", "error");
         }
         syncContactsToCustomer(c);
-        state.dirty = true;
+        markDirty();
         renderDetail();
         renderList();
         return;
@@ -1558,7 +1878,7 @@
         const i = parseInt(e.target.dataset.i);
         c._contacts.splice(i, 1);
         syncContactsToCustomer(c);
-        state.dirty = true;
+        markDirty();
         renderDetail();
       }
     });
@@ -1602,7 +1922,7 @@
         // V2: only edit, no copy
         inlineEditContact(target, ct, () => {
           syncContactsToCustomer(c);
-          state.dirty = true;
+          markDirty();
           renderDetail();
         });
         return;
@@ -1610,13 +1930,13 @@
         // V2: only edit, no copy
         inlineEdit(target, ct, "Name", () => {
           syncContactsToCustomer(c);
-          state.dirty = true;
+          markDirty();
           renderDetail();
         });
         return;
       }
       syncContactsToCustomer(c);
-      state.dirty = true;
+      markDirty();
       renderDetail();
       renderList();
     });
@@ -1624,7 +1944,7 @@
     // Log live update
     $("logArea").addEventListener("input", () => {
       c.Log = $("logArea").value;
-      state.dirty = true;
+      markDirty();
     });
 
     // Save
@@ -1636,7 +1956,7 @@
         state.filteredIdx = state.filteredIdx.filter(i => i !== state.currentIdx)
           .map(i => i > state.currentIdx ? i - 1 : i);
         state.currentIdx = state.filteredIdx.length > 0 ? state.filteredIdx[0] : -1;
-        state.dirty = true;
+        markDirty();
         saveToLocal();
         renderAll();
         toast("客户已删除", "success");
@@ -1652,7 +1972,7 @@
       state.customers.push(dup);
       state.currentIdx = state.customers.length - 1;
       state.filteredIdx.push(state.currentIdx);
-      state.dirty = true;
+      markDirty();
       saveToLocal();
       renderAll();
       toast("已复制为新客户，请修改 ID/公司后保存", "success");
@@ -1712,7 +2032,7 @@
         Com_Records: "0r0",
       });
       syncContactsToCustomer(c);
-      state.dirty = true;
+      markDirty();
       renderDetail();
       toast(`已添加联系方式，自动识别类型：${detected}`, "success");
     };
@@ -1833,7 +2153,7 @@
       }
       c._isNew = false;
     }
-    state.dirty = true;
+    markDirty();
     saveToLocal();
     renderList();
     updateStats();
@@ -2109,6 +2429,7 @@
       added++;
     }
     state.filteredIdx = state.customers.map((_, i) => i);
+    markDirty();
     saveToLocal();
     renderAll();
     toast(`批量导入完成：新增 ${added} 条，跳过 ${failed} 条重复`, added > 0 ? "success" : "error");
@@ -2125,6 +2446,7 @@
       autoSetDates(c);
       if (c.Next !== before) updated++;
     }
+    markDirty();
     saveToLocal();
     renderAll();
     toast(`批量更新完成：${updated} 条客户的跟进日期已刷新`, "success");
@@ -2176,14 +2498,14 @@
         </div>
       </div>
       <div class="cfg-section">
-        <h4>自动保存（每30分钟）</h4>
+        <h4>自动保存与云同步</h4>
         <div class="backup-status" id="backupStatus"></div>
         <div class="backup-actions" id="backupActions"></div>
       </div>
 
-      <!-- Google Drive 配置 -->
+      <!-- Google Sheets 云库配置 -->
       <div class="cfg-section" id="googleDriveConfigSection" style="display:none;">
-        <h4>☁️ Google Drive 配置</h4>
+        <h4>🗄️ Google Sheets 云库配置</h4>
         <div style="padding:10px;background:rgba(30,50,90,0.03);border-radius:6px;border:1px solid var(--border);">
           <div style="margin-bottom:10px;">
             <label style="font-weight:700;font-size:12px;color:var(--ink);">Client ID</label>
@@ -2196,13 +2518,14 @@
           <div style="font-size:11px;color:var(--ink-dim);line-height:1.6;background:#fff;padding:8px;border-radius:4px;border:1px solid var(--border);">
             <b style="color:var(--accent);">获取步骤：</b><br>
             1. 访问 <a href="https://console.cloud.google.com/" target="_blank" style="color:var(--accent);">Google Cloud Console</a><br>
-            2. 创建项目（或选择已有项目）<br>
+            2. 创建项目（或选择已有项目）→ 启用 <b>Google Sheets API</b> 与 <b>Google Drive API</b><br>
             3. 点击「API和服务」→「凭据」→「创建凭据」→「OAuth 客户端 ID」<br>
             4. 应用类型选择「网页应用」<br>
             5. 在「已获准的重定向 URI」中添加：<code style="background:rgba(37,99,235,0.1);padding:1px 4px;border-radius:3px;">${window.location.origin}</code><br>
-            6. 复制 Client ID 和 API Key 填入上方
+            6. 复制 Client ID 和 API Key 填入上方<br>
+            <span style="color:var(--ink-faint);">登录后数据保存在一个名为「${GOOGLE_SHEET_TITLE}」的 Google 表格中，编辑停顿 4 秒自动同步。</span>
           </div>
-          <button class="sbtn small" id="saveGoogleConfig" style="margin-top:8px;">保存 Google Drive 配置</button>
+          <button class="sbtn small" id="saveGoogleConfig" style="margin-top:8px;">保存配置</button>
         </div>
       </div>
 
@@ -2442,84 +2765,78 @@
   }
 
   async function runAutoSave(silent) {
-    if (!state.dirty && currentAutoSaveFileName) {
-      if (!silent) toast("数据无更新，无需保存", "success");
+    // silent timers: nothing to do when data is clean
+    if (silent && !state.dirty) return;
+    // manual save with clean data and no cloud attached → inform user
+    if (!silent && !state.dirty && !cloudStorage.googleToken && currentAutoSaveFileName) {
+      toast("数据无更新，无需保存", "success");
       return;
     }
 
-    // Generate new filename with timestamp
+    // Generate new filename with timestamp (used only for xlsx backups)
     const now = new Date();
     const ts = now.toISOString().replace(/[:.]/g, "-").slice(0, 19);
     const newFileName = `客户总表_自动保存_${ts}.xlsx`;
 
-    // Build workbook and save
-    const wb = buildWorkbook();
-    const buf = XLSX.write(wb, { type: "array", bookType: "xlsx" });
-
     const savedLocations = [];
     const failedLocations = [];
+    let wroteXlsxBackup = false; // whether currentAutoSaveFileName should be updated
 
-    // 1. Save to local folder (if available)
-    if (workingDirHandle) {
-      try {
-        const ok = await ensureWorkingFolderPermission();
-        if (ok) {
-          await deletePreviousAutoSave();
-          const fileHandle = await workingDirHandle.getFileHandle(newFileName, { create: true });
-          const writable = await fileHandle.createWritable();
-          await writable.write(buf);
-          await writable.close();
-          savedLocations.push(workingDirHandle.name);
-        }
-      } catch (e) {
-        console.warn("Local save failed", e);
-        failedLocations.push("本地");
-      }
-    } else if (state.fileName && typeof state.fileHandle !== 'undefined' && state.fileHandle) {
-      // Use the folder from the opened file as default
-      try {
-        const parentDir = await state.fileHandle.getFile();
-        // Note: Can't get parent directory from file handle, skip
-      } catch (e) {
-        // Ignore
-      }
-    }
-
-    // 2. Save to cloud (if configured) - always save if token exists
+    // 0. V5: Google = Sheets cloud database (primary). No temp xlsx is uploaded.
     if (cloudStorage.googleToken) {
       try {
-        // Delete previous cloud file
-        if (currentAutoSaveFileName) {
-          await googleDriveDeleteFile(currentAutoSaveFileName);
-        }
-        const success = await googleDriveUpload(newFileName, buf);
-        if (success) savedLocations.push("Google Drive");
-        else failedLocations.push("Google Drive");
+        const success = await cloudPushData(silent);
+        if (success) savedLocations.push("Google Sheets 云库");
+        else failedLocations.push("Google Sheets 云库");
       } catch (e) {
-        console.warn("Google Drive save failed", e);
-        failedLocations.push("Google Drive");
+        console.warn("Google Sheets save failed", e);
+        failedLocations.push("Google Sheets 云库");
       }
     }
 
-    if (cloudStorage.onedriveToken) {
-      try {
-        // Delete previous cloud file
-        if (currentAutoSaveFileName) {
-          await onedriveDeleteFile(currentAutoSaveFileName);
+    // 1. Backup to local folder (xlsx) if available
+    const wantXlsx = !!(workingDirHandle || cloudStorage.onedriveToken);
+    if (wantXlsx) {
+      const wb = buildWorkbook();
+      const buf = XLSX.write(wb, { type: "array", bookType: "xlsx" });
+
+      if (workingDirHandle) {
+        try {
+          const ok = await ensureWorkingFolderPermission();
+          if (ok) {
+            await deletePreviousAutoSave();
+            const fileHandle = await workingDirHandle.getFileHandle(newFileName, { create: true });
+            const writable = await fileHandle.createWritable();
+            await writable.write(buf);
+            await writable.close();
+            savedLocations.push(workingDirHandle.name);
+            wroteXlsxBackup = true;
+          }
+        } catch (e) {
+          console.warn("Local save failed", e);
+          failedLocations.push("本地");
         }
-        const success = await onedriveUpload(newFileName, buf);
-        if (success) savedLocations.push("OneDrive");
-        else failedLocations.push("OneDrive");
-      } catch (e) {
-        console.warn("OneDrive save failed", e);
-        failedLocations.push("OneDrive");
+      }
+
+      // 2. Backup to OneDrive (xlsx) if connected
+      if (cloudStorage.onedriveToken) {
+        try {
+          const success = await onedriveUpload(newFileName, buf);
+          if (success) { savedLocations.push("OneDrive"); wroteXlsxBackup = true; }
+          else failedLocations.push("OneDrive");
+        } catch (e) {
+          console.warn("OneDrive save failed", e);
+          failedLocations.push("OneDrive");
+        }
       }
     }
 
     // Update state if any save succeeded
     if (savedLocations.length > 0) {
-      currentAutoSaveFileName = newFileName;
-      await idbPut(LAST_SAVE_NAME_KEY, newFileName);
+      if (wroteXlsxBackup) {
+        currentAutoSaveFileName = newFileName;
+        await idbPut(LAST_SAVE_NAME_KEY, newFileName);
+      }
       state.dirty = false;
       lastAutoSaveTime = now.toLocaleString();
       saveToLocal();
@@ -2562,9 +2879,14 @@
 
     // Cloud storage status
     html += `<div style="margin-bottom:6px;">
-      <b>☁️ 网盘同步：</b>`;
+      <b>🗄️ 云数据库：</b>`;
     if (cloudStorage.googleToken) {
-      html += `<span style="color:var(--success);">Google Drive 已连接</span>`;
+      if (cloudSheetId) {
+        html += `<span style="color:var(--success);">Google Sheets 已连接</span>`;
+        if (lastCloudSyncTime) html += `<div style="font-size:11px;color:var(--ink-faint);margin-top:2px;">上次同步：${escapeHtml(lastCloudSyncTime)}</div>`;
+      } else {
+        html += `<span class="bk-warn">Google 已登录，云端表格未创建（保存数据时自动创建）</span>`;
+      }
     } else if (cloudStorage.onedriveToken) {
       html += `<span style="color:var(--success);">OneDrive 已连接</span>`;
     } else {
@@ -2575,9 +2897,9 @@
     // Auto-save info
     html += `<div style="font-size:11px;color:var(--ink-faint);margin-top:8px;padding:6px 8px;background:rgba(30,50,90,0.03);border-radius:4px;">
       <b style="color:var(--ink-dim);">自动保存说明：</b><br>
-      • 每30分钟自动保存一次（有更新时）<br>
+      • Google 云库：编辑停顿 <b>4 秒</b>自动同步，另每 <b>10 分钟</b>兜底一次<br>
       • 本地文件夹：保存到 <b>客户总表_自动保存_时间戳.xlsx</b>，每次保存前删除旧文件<br>
-      • 网盘：同步保存到已连接的云盘<br>
+      • OneDrive：同步保存 xlsx 备份到已连接的 OneDrive<br>
       • ${workingDirHandle ? '上次保存：' + (lastAutoSaveTime ? `<b>${escapeHtml(lastAutoSaveTime)}</b>` : '<span class="bk-warn">尚未保存</span>') : '请先选择本地文件夹'}
     </div>`;
     html += `</div>`;
@@ -2587,7 +2909,7 @@
       <label style="font-weight:700;color:var(--ink);font-size:12px;">连接网盘账号：</label>
       <select id="cloudProviderSelect" style="height:28px;padding:0 8px;border:1px solid var(--border);border-radius:6px;background:#fff;color:var(--ink);font-size:11px;margin-left:6px;">
         <option value="none" ${!cloudStorage.googleToken && !cloudStorage.onedriveToken ? "selected" : ""}>不连接</option>
-        <option value="google" ${cloudStorage.googleToken ? "selected" : ""}>Google Drive</option>
+        <option value="google" ${cloudStorage.googleToken ? "selected" : ""}>Google Sheets 云库</option>
         <option value="onedrive" ${cloudStorage.onedriveToken ? "selected" : ""}>OneDrive</option>
       </select>
     </div>`;
@@ -2668,10 +2990,20 @@
     // Always show local folder selector
     buttonsHtml += `<button class="sbtn small" id="btnPickBackup">${workingDirHandle ? '更换' : '选择'}工作文件夹</button>`;
 
+    // Google connected → cloud database controls
+    if (cloudStorage.googleToken) {
+      if (cloudSheetId) {
+        buttonsHtml += `<button class="sbtn small" id="btnCloudPull">从云库打开</button>`;
+        buttonsHtml += `<button class="sbtn small success" id="btnCloudPush">同步到云库</button>`;
+      } else {
+        buttonsHtml += `<button class="sbtn small" id="btnCloudCreate">创建云库并同步</button>`;
+      }
+    }
+
     // Show cloud login buttons if not connected
     if (!cloudStorage.googleToken && !cloudStorage.onedriveToken) {
       if (isGoogleDriveConfigured()) {
-        buttonsHtml += `<button class="sbtn small" id="btnGoogleLogin">登录 Google Drive</button>`;
+        buttonsHtml += `<button class="sbtn small" id="btnGoogleLogin">登录 Google（Sheets 云库）</button>`;
       }
       if (isOneDriveConfigured()) {
         buttonsHtml += `<button class="sbtn small" id="btnOneDriveLogin">登录 OneDrive</button>`;
@@ -2679,7 +3011,7 @@
     }
 
     // Always show save now button
-    buttonsHtml += `<button class="sbtn small success" id="btnBackupNow">立即保存</button>`;
+    buttonsHtml += `<button class="sbtn small" id="btnBackupNow">立即保存</button>`;
 
     // Show stop button if auto-save is active
     if (workingDirHandle || cloudStorage.googleToken || cloudStorage.onedriveToken) {
@@ -2694,6 +3026,9 @@
     const btnClear = $("btnClearBackup");
     const btnGoogleLogin = $("btnGoogleLogin");
     const btnOneDriveLogin = $("btnOneDriveLogin");
+    const btnCloudPull = $("btnCloudPull");
+    const btnCloudPush = $("btnCloudPush");
+    const btnCloudCreate = $("btnCloudCreate");
 
     if (btnPick) btnPick.onclick = () => pickWorkingFolder();
     if (btnNow) btnNow.onclick = () => runAutoSave(false);
@@ -2701,7 +3036,9 @@
     if (btnGoogleLogin) btnGoogleLogin.onclick = async () => {
       const success = await authenticateGoogleDrive();
       if (success) {
-        toast("Google Drive 已连接，将同时保存到本地和云端", "success");
+        cloudStorage.provider = "google";
+        await saveCloudStorageState();
+        toast("Google 已登录，点击「创建云库并同步」或「从云库打开」", "success");
         updateWorkingFolderStatusUI();
         updateCloudButtons();
       }
@@ -2710,6 +3047,33 @@
       const success = await authenticateOneDrive();
       if (success) {
         toast("OneDrive 已连接，将同时保存到本地和云端", "success");
+        updateWorkingFolderStatusUI();
+        updateCloudButtons();
+      }
+    };
+    if (btnCloudCreate) btnCloudCreate.onclick = async () => {
+      const sid = await ensureCloudSpreadsheet();
+      if (sid) {
+        await cloudPushData(false);
+        toast("云库已创建并同步", "success");
+        updateWorkingFolderStatusUI();
+        updateCloudButtons();
+      }
+    };
+    if (btnCloudPush) btnCloudPush.onclick = async () => {
+      await cloudPushData(false);
+      updateWorkingFolderStatusUI();
+      updateCloudButtons();
+    };
+    if (btnCloudPull) btnCloudPull.onclick = async () => {
+      if (state.dirty) {
+        showConfirm("从云库打开", "当前有未保存的修改，从云库加载会覆盖它们。继续？", async () => {
+          await cloudPullData(false);
+          updateWorkingFolderStatusUI();
+          updateCloudButtons();
+        });
+      } else {
+        await cloudPullData(false);
         updateWorkingFolderStatusUI();
         updateCloudButtons();
       }
@@ -2746,12 +3110,16 @@
     // V4: open IndexedDB first
     try { await idbOpen(); } catch (e) { console.warn("IDB open failed", e); }
 
+    // V5: restore cloud state (token + spreadsheet id) as early as possible
+    try { await loadCloudStorageState(); } catch (e) { console.warn("load cloud state failed", e); }
+
     // Check if returning from OAuth redirect
     if (window.location.hash.includes("access_token")) {
       try {
-        await loadCloudStorageState();
         const success = await authenticateGoogleDrive();
         if (success) {
+          cloudStorage.provider = "google";
+          await saveCloudStorageState();
           // Reload to clean state
           window.location.reload();
           return;
@@ -2789,14 +3157,25 @@
         localOption.onclick = (ev) => { ev.stopPropagation(); menu.remove(); $("fileInput").click(); };
         menu.appendChild(localOption);
 
-        // Google Drive option
+        // Google Sheets cloud database option
         if (cloudStorage.googleToken) {
-          const googleOption = document.createElement("div");
-          googleOption.className = "dropdown-item";
-          googleOption.style.cssText = "padding: 8px 16px; cursor: pointer; font-size: 13px; display: flex; align-items: center; gap: 8px;";
-          googleOption.innerHTML = `<span>☁️</span><span>从 Google Drive 打开</span>`;
-          googleOption.onclick = (ev) => { ev.stopPropagation(); menu.remove(); openGoogleDriveFile(); };
-          menu.appendChild(googleOption);
+          const cloudDbOption = document.createElement("div");
+          cloudDbOption.className = "dropdown-item";
+          cloudDbOption.style.cssText = "padding: 8px 16px; cursor: pointer; font-size: 13px; display: flex; align-items: center; gap: 8px;";
+          cloudDbOption.innerHTML = `<span>🗄️</span><span>从 Google Sheets 云库打开</span>`;
+          cloudDbOption.onclick = (ev) => {
+            ev.stopPropagation();
+            menu.remove();
+            if (state.dirty) {
+              showConfirm("从云库打开", "当前有未保存的修改，从云库加载会覆盖它们。继续？", async () => {
+                await cloudPullData(false);
+                updateCloudSyncUI();
+              });
+            } else {
+              cloudPullData(false).then(() => updateCloudSyncUI());
+            }
+          };
+          menu.appendChild(cloudDbOption);
         }
 
         // OneDrive option
@@ -2858,6 +3237,8 @@
         $("configModal").hidden = true;
         populateFilterDropdowns();
         toast("配置已保存", "success");
+        // V5: sync config to cloud DB when connected
+        if (cloudEnabled() && cloudSheetId) cloudPushData(true);
       });
 
       // Confirm modal
@@ -2880,12 +3261,24 @@
       console.error("Event binding failed:", e);
     }
 
-    // Load data and restore state
+    // Load data and restore state — V5: cloud is primary when connected
+    let loadedFromCloud = false;
     try {
-      if (await loadFromLocal()) {
+      if (cloudStorage.provider === "google" && cloudEnabled() && cloudSheetId) {
+        const hadRowsBefore = state.customers.length > 0;
+        const pulled = await cloudPullData(true); // renders inside on success
+        // Treat an empty cloud DB as "no cloud data yet" so we keep local cache
+        loadedFromCloud = pulled && (state.customers.length > 0 || !hadRowsBefore);
+      }
+    } catch (e) {
+      console.warn("Cloud restore failed:", e);
+    }
+
+    try {
+      if (!loadedFromCloud && await loadFromLocal()) {
         renderAll();
         toast(`已从本地恢复 ${state.customers.length} 条客户数据`, "success");
-      } else {
+      } else if (!loadedFromCloud) {
         populateFilterDropdowns();
         updateStats();
       }
@@ -2895,11 +3288,12 @@
       updateStats();
     }
 
-    // V4: restore working folder handle + start 30-min timer
+    // V4: restore working folder handle + timers (V5 adds cloud fallback)
     try {
       await restoreWorkingFolderHandle();
-      await loadCloudStorageState();
       startAutoSaveTimer();
+      startCloudFallbackTimer();
+      updateCloudSyncUI();
     } catch (e) {
       console.warn("Cloud storage restore failed:", e);
     }
