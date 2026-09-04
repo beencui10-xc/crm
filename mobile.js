@@ -398,7 +398,7 @@
         </div>
         <div class="m-btn-row">
           <button class="m-btn primary m-act" data-i="${i}">${isWa ? "💬 " : ""}联系</button>
-          <button class="m-btn m-copy" data-i="${i}">复制</button>
+          <button class="m-btn m-edit" data-i="${i}">✏️ 编辑</button>
           ${!isToday ? `<button class="m-btn m-mark" data-i="${i}">✓ 标记今日</button>` : `<span class="m-marked">✓ 今日已联系</span>`}
         </div>
       </div>`;
@@ -408,19 +408,14 @@
     $m("mContactsBody").querySelectorAll(".m-contact-value").forEach(el => {
       el.addEventListener("click", () => copyText(el.textContent));
     });
-    $m("mContactsBody").querySelectorAll(".m-copy").forEach(el => {
-      el.addEventListener("click", () => {
-        const ct = c._contacts[parseInt(el.dataset.i)];
-        if (ct) copyText(api.displayContactValue(ct.Contact));
-      });
+    $m("mContactsBody").querySelectorAll(".m-edit").forEach(el => {
+      el.addEventListener("click", () => openEditContactSheet(c, parseInt(el.dataset.i)));
     });
-    // 联系 = desktop behavior: trigger external action + record today
+    // 联系 = mobile deep-link action + record today
     $m("mContactsBody").querySelectorAll(".m-act").forEach(el => {
       el.addEventListener("click", () => {
         const i = parseInt(el.dataset.i);
-        const ct = c._contacts[i];
-        if (!ct) return;
-        api.triggerContactAction(ct.Contact, ct.Type);
+        mContactAction(c, i);
         markContacted(c, i);
       });
     });
@@ -440,6 +435,151 @@
     c.Log = (c.Log || "") + `\n ${today}: 联系了 ${api.displayContactValue(ct.Contact)}`;
     persist(c);
     api.toast(`已记录今日联系: ${api.displayContactValue(ct.Contact)}`, "success");
+  }
+
+  /* ------- mobile deep-link actions (phone OS opens the right app) ------- */
+  function openExtURL(u) {
+    // new tab — system routes https App Links / Universal Links to the installed app
+    window.open(u, "_blank");
+  }
+  function ensureURL(u) {
+    u = String(u || "").trim();
+    if (!u) return "";
+    return /^https?:\/\//i.test(u) ? u : "https://" + u;
+  }
+  function mContactAction(c, i) {
+    const ct = c._contacts[i];
+    if (!ct) return;
+    const clean = api.displayContactValue(ct.Contact);
+    const detected = api.detectContactType(clean);
+    const typeLower = String(ct.Type || "").toLowerCase();
+
+    // ---- Email → mailto: 手机系统自动弹出邮箱应用选择器 ----
+    if (detected === "Email") {
+      const subject = c && c.Company ? `${c.Company} — 跟进` : "客户跟进";
+      window.location.href = `mailto:${encodeURIComponent(clean)}?subject=${encodeURIComponent(subject)}`;
+      api.toast("正在打开邮箱应用…", "success");
+      return;
+    }
+    // ---- WhatsApp → wa.me（Universal Link，自动唤起 WhatsApp 到该联系人）----
+    if (typeLower === "whatsapp" || detected === "WhatsApp") {
+      const digits = clean.replace(/[^\d]/g, "");
+      if (!digits) { api.toast("无法识别 WhatsApp 号码", "error"); return; }
+      copyText(clean);
+      openExtURL(`https://wa.me/${digits}`);
+      return;
+    }
+    // ---- Phone → tel: 跳转拨号盘 ----
+    if (detected === "Phone" || typeLower === "phone") {
+      const tel = clean.replace(/[^\d+]/g, "");
+      if (!tel) { api.toast("无法识别电话号码", "error"); return; }
+      window.location.href = `tel:${tel}`;
+      return;
+    }
+    // ---- 社媒平台：打开 https 链接，系统自动路由到已安装的 App ----
+    if (typeLower === "linkedin" || /^linkedin/i.test(detected)) {
+      if (/linkedin\.com/i.test(clean)) openExtURL(ensureURL(clean));
+      else openExtURL("https://www.linkedin.com/search/results/all/?keywords=" + encodeURIComponent(clean));
+      return;
+    }
+    if (typeLower === "facebook") {
+      if (/facebook\.com|fb\.com/i.test(clean)) openExtURL(ensureURL(clean));
+      else openExtURL("https://www.facebook.com/search/top?q=" + encodeURIComponent(clean));
+      return;
+    }
+    if (typeLower === "instagram") {
+      const handle = clean.replace(/^@/, "").replace(/https?:\/\/(www\.)?instagram\.com\//i, "").replace(/\/$/, "");
+      if (handle) openExtURL("https://www.instagram.com/" + encodeURIComponent(handle) + "/");
+      return;
+    }
+    if (typeLower === "twitter") {
+      const handle = clean.replace(/^@/, "").replace(/https?:\/\/(www\.)?(twitter|x)\.com\//i, "").replace(/\/$/, "");
+      if (handle) openExtURL("https://x.com/" + encodeURIComponent(handle));
+      return;
+    }
+    if (typeLower === "tiktok") {
+      if (/tiktok\.com/i.test(clean)) openExtURL(ensureURL(clean));
+      else openExtURL("https://www.tiktok.com/search?q=" + encodeURIComponent(clean));
+      return;
+    }
+    if (typeLower === "wechat") {
+      copyText(clean);
+      api.toast("微信号已复制，请打开微信搜索添加", "success");
+      return;
+    }
+    // ---- Website → 浏览器打开 ----
+    if (detected === "Website") { openExtURL(ensureURL(clean)); return; }
+    // ---- Others: 复制兜底 ----
+    copyText(clean);
+    api.toast("内容已复制", "success");
+  }
+
+  /* ------- edit an existing contact (full edit + delete) ------- */
+  function openEditContactSheet(c, i) {
+    const ct = c._contacts[i];
+    if (!ct) return;
+    const types = api.state.config.contactTypeList || [];
+    const statuses = api.state.config.contactStatusList || ["Active", "Bounce", "Deactivated", "Removed"];
+    const typeOpts = (list, sel) => {
+      const all = list.slice();
+      if (sel && !all.includes(sel)) all.push(sel);
+      return all.map(x => `<option ${x === sel ? "selected" : ""}>${esc(x)}</option>`).join("");
+    };
+    openSheet(`
+      <div class="m-sheet-title">编辑联系方式</div>
+      <div class="m-f-grid">
+        <div><label class="m-f-label">类型</label><select class="m-f-input" id="mEType">${typeOpts(types, ct.Type)}</select></div>
+        <div><label class="m-f-label">状态</label><select class="m-f-input" id="mEStatus">${typeOpts(statuses, ct.Status)}</select></div>
+      </div>
+      <label class="m-f-label">联系方式</label>
+      <input class="m-f-input" id="mEValue" value="${esc(api.displayContactValue(ct.Contact))}" placeholder="邮箱 / 电话 / 网址…" />
+      <label class="m-f-label">联系人姓名</label>
+      <input class="m-f-input" id="mEName" value="${esc(ct.Name || "")}" />
+      <div class="m-f-grid">
+        <div><label class="m-f-label">最近联系</label><input class="m-f-input" type="date" id="mELast" value="${esc(api.fmtDate(ct.Com_Last))}" /></div>
+        <div><label class="m-f-label">记录 (我r对方)</label><input class="m-f-input" id="mERec" value="${esc(ct.Com_Records || "0r0")}" /></div>
+      </div>
+      <div class="m-btn-row sheet">
+        <button class="m-btn primary" id="mESave">保存</button>
+        <button class="m-btn danger" id="mEDelete">🗑 删除</button>
+        <button class="m-btn" id="mECancel">取消</button>
+      </div>`);
+    // two-tap delete confirm
+    const delBtn = $m("mEDelete");
+    let delArmed = false, delTimer = null;
+    delBtn.addEventListener("click", () => {
+      if (!delArmed) {
+        delArmed = true;
+        delBtn.textContent = "确认删除?";
+        delTimer = setTimeout(() => { delArmed = false; delBtn.innerHTML = "🗑 删除"; }, 2500);
+        return;
+      }
+      clearTimeout(delTimer);
+      c._contacts.splice(i, 1);
+      persist(c);
+      closeSheet();
+      api.toast("联系方式已删除", "success");
+    });
+    $m("mESave").addEventListener("click", () => {
+      const v = $m("mEValue").value.trim();
+      if (!v) { api.toast("请输入联系方式", "error"); return; }
+      ct.Type = $m("mEType").value;
+      ct.Status = $m("mEStatus").value;
+      ct.Name = $m("mEName").value.trim();
+      // keep "|" storage prefix for phone-like values (Excel float protection, same as desktop)
+      const det2 = api.detectContactType(v);
+      const phoneLike = det2 === "Phone" || det2 === "WhatsApp" ||
+        String(ct.Type).toLowerCase() === "phone" || String(ct.Type).toLowerCase() === "whatsapp";
+      ct.Contact = (phoneLike && !v.startsWith("|")) ? "|" + v : v;
+      const last = $m("mELast").value;
+      if (last) ct.Com_Last = last;
+      const rec = $m("mERec").value.trim();
+      if (/^\d+r\d+$/.test(rec)) ct.Com_Records = rec;
+      persist(c);
+      closeSheet();
+      api.toast("联系方式已保存", "success");
+    });
+    $m("mECancel").addEventListener("click", closeSheet);
   }
 
   function openAddContactSheet() {

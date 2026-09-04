@@ -145,6 +145,11 @@ html:has(body.m-active) { overflow: hidden; }
   border-radius: 12px; padding: 10px 0; font-size: 14px; cursor: pointer;
 }
 .m-btn.primary { background: #4f74e3; border-color: #4f74e3; color: #fff; font-weight: 600; }
+.m-btn.danger { background: #fdecec; border-color: #f3c1c1; color: #d24a4a; font-weight: 600; flex: 0 0 auto; padding: 10px 14px; }
+/* contact card action row: allow wrap so 3 buttons never squeeze */
+.m-contact .m-btn-row { flex-wrap: wrap; }
+.m-contact .m-btn { min-width: 88px; }
+.m-contact .m-marked { margin-left: auto; }
 .m-btn:active { opacity: 0.85; }
 .m-mini-btn {
   border: none; background: #eef1f9; color: #4f74e3;
