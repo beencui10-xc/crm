@@ -2693,6 +2693,7 @@
     renderDetail();
     updateStats();
     $("lastSaved").textContent = state.fileName ? `当前文件: ${state.fileName}` : "未加载数据";
+    window.dispatchEvent(new CustomEvent("cfms:datachanged"));
   }
 
   function populateFilterDropdowns() {
@@ -3305,7 +3306,25 @@
         runAutoSave(true);
       }
     });
+
+    // V5.1 — notify mobile UI layer that data is ready
+    window.dispatchEvent(new CustomEvent("cfms:ready"));
   }
+
+  /* ============================================================
+     V5.1 — MOBILE BRIDGE (consumed by mobile.js; no-op on desktop)
+     ============================================================ */
+  window.CFMS = {
+    state,
+    escapeHtml, parseDate, todayStr, fmtDate, addDays,
+    autoSetDates, syncContactsToCustomer, markDirty, saveToLocal, toast,
+    triggerContactAction, displayContactValue, detectContactType,
+    refreshUI: () => {
+      renderList(); renderDetail(); updateStats();
+      window.dispatchEvent(new CustomEvent("cfms:datachanged"));
+    },
+    openConfigModal: openConfig,
+  };
 
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", init);
