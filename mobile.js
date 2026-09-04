@@ -444,6 +444,23 @@
     window.matchMedia("(display-mode: standalone)").matches ||
     window.navigator.standalone === true;
 
+  const UA = navigator.userAgent || "";
+  const isIOS = /iPad|iPhone|iPod/.test(UA) ||
+    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  const isAndroid = /Android/i.test(UA);
+
+  // Android intent:// URI — parsed by the Chromium navigation layer itself
+  // and dispatched to the OS, which is the ONLY way to reliably leave
+  // OEM/WebView-based PWA standalone containers. Plain "tel:"/"mailto:"/
+  // "whatsapp://" navigations fail there with net::ERR_UNKNOWN_URL_SCHEME
+  // (the container tries to load them as web URLs).
+  function androidIntentURL(scheme, data, pkg, fallback) {
+    let u = `intent:${data}#Intent;scheme=${scheme};`;
+    if (pkg) u += `package=${pkg};`;
+    if (fallback) u += `S.browser_fallback_url=${encodeURIComponent(fallback)};`;
+    return u + "end";
+  }
+
   function anchorClick(u, newTab) {
     // <a> click survives where window.open is blocked (browser context).
     const a = document.createElement("a");
@@ -491,46 +508,68 @@
     const detected = api.detectContactType(clean);
     const typeLower = String(ct.Type || "").toLowerCase();
 
-    // ---- Email → mailto: 系统弹出邮箱应用选择器；失败则地址已复制 ----
+    // ---- Email → 系统邮箱应用；失败则地址已复制 ----
     if (detected === "Email") {
       const subject = c && c.Company ? `${c.Company} — 跟进` : "客户跟进";
       copyText(clean);
-      openAppScheme(
-        `mailto:${encodeURIComponent(clean)}?subject=${encodeURIComponent(subject)}`,
-        () => api.toast("邮箱地址已复制，请打开邮箱 App 粘贴发送", "success"),
-        "邮箱已复制 · 正在打开邮箱应用…");
+      const copyFallback = () => api.toast("邮箱地址已复制，请打开邮箱 App 粘贴发送", "success");
+      if (isAndroid) {
+        // intent:// — OEM standalone 容器里 mailto: 会报 ERR_UNKNOWN_URL_SCHEME
+        openAppScheme(
+          androidIntentURL("mailto", clean, "", ""),
+          copyFallback,
+          "邮箱已复制 · 正在打开邮箱应用…");
+      } else {
+        openAppScheme(
+          `mailto:${clean}?subject=${encodeURIComponent(subject)}`,
+          copyFallback,
+          "邮箱已复制 · 正在打开邮箱应用…");
+      }
       return;
     }
-    // ---- WhatsApp → whatsapp:// 协议直达 App（standalone 唯一可靠方式），
-    //      App 未装时降级 wa.me 网页版 ----
+    // ---- WhatsApp → intent/协议直达 App，App 未装时降级 wa.me 网页版 ----
     if (typeLower === "whatsapp" || detected === "WhatsApp") {
       const digits = clean.replace(/[^\d]/g, "");
       if (!digits) { api.toast("无法识别 WhatsApp 号码", "error"); return; }
       copyText(clean);
-      openAppScheme(
-        `whatsapp://send?phone=${digits}`,
-        () => openExtURL(`https://wa.me/${digits}`),
-        "正在打开 WhatsApp…");
+      const waFallback = () => openExtURL(`https://wa.me/${digits}`);
+      if (isAndroid) {
+        openAppScheme(
+          androidIntentURL("whatsapp", `//send/${digits}`, "com.whatsapp", `https://wa.me/${digits}`),
+          waFallback,
+          "正在打开 WhatsApp…");
+      } else {
+        openAppScheme(`whatsapp://send?phone=${digits}`, waFallback, "正在打开 WhatsApp…");
+      }
       return;
     }
-    // ---- Phone → tel: 跳转拨号盘 ----
+    // ---- Phone → 拨号盘 ----
     if (detected === "Phone" || typeLower === "phone") {
       const tel = clean.replace(/[^\d+]/g, "");
       if (!tel) { api.toast("无法识别电话号码", "error"); return; }
-      openAppScheme(
-        `tel:${tel}`,
-        () => { copyText(tel); api.toast("号码已复制，请手动拨打", "success"); },
-        "正在打开拨号…");
+      const telFallback = () => { copyText(tel); api.toast("号码已复制，请手动拨打", "success"); };
+      if (isAndroid) {
+        openAppScheme(
+          androidIntentURL("tel", tel.replace(/\+/g, "%2B"), "", ""),
+          telFallback,
+          "正在打开拨号…");
+      } else {
+        openAppScheme(`tel:${tel}`, telFallback, "正在打开拨号…");
+      }
       return;
     }
-    // ---- 社媒平台：App 协议优先（standalone 可靠），失败降级网页链接 ----
+    // ---- 社媒平台：intent/协议直达 App，失败降级网页链接 ----
     if (typeLower === "linkedin" || /^linkedin/i.test(detected)) {
       const inMatch = clean.match(/linkedin\.com\/in\/([^\/\s?#]+)/i);
+      const liFallback = () => openExtURL(ensureURL(clean));
       if (inMatch) {
-        openAppScheme(
-          `linkedin://profile/${inMatch[1]}`,
-          () => openExtURL(ensureURL(clean)),
-          "正在打开 LinkedIn…");
+        if (isAndroid) {
+          openAppScheme(
+            androidIntentURL("linkedin", `//profile/${inMatch[1]}`, "com.linkedin.android", ensureURL(clean)),
+            liFallback, "正在打开 LinkedIn…");
+        } else {
+          openAppScheme(`linkedin://profile/${inMatch[1]}`, liFallback, "正在打开 LinkedIn…");
+        }
       } else {
         const url = /linkedin\.com/i.test(clean) ? ensureURL(clean)
           : "https://www.linkedin.com/search/results/all/?keywords=" + encodeURIComponent(clean);
@@ -542,10 +581,14 @@
     if (typeLower === "facebook") {
       if (/facebook\.com|fb\.com/i.test(clean)) {
         const u = ensureURL(clean);
-        openAppScheme(
-          "fb://facewebmodal/f?href=" + encodeURIComponent(u),
-          () => openExtURL(u),
-          "正在打开 Facebook…");
+        const fbFallback = () => openExtURL(u);
+        if (isAndroid) {
+          openAppScheme(
+            androidIntentURL("fb", `facewebmodal/f?href=${encodeURIComponent(u)}`, "com.facebook.katana", u),
+            fbFallback, "正在打开 Facebook…");
+        } else {
+          openAppScheme("fb://facewebmodal/f?href=" + encodeURIComponent(u), fbFallback, "正在打开 Facebook…");
+        }
       } else {
         openExtURL("https://www.facebook.com/search/top?q=" + encodeURIComponent(clean));
         api.toast("正在打开 Facebook…", "success");
@@ -554,18 +597,32 @@
     }
     if (typeLower === "instagram") {
       const handle = clean.replace(/^@/, "").replace(/https?:\/\/(www\.)?instagram\.com\//i, "").replace(/\/$/, "");
-      if (handle) openAppScheme(
-        `instagram://user?username=${encodeURIComponent(handle)}`,
-        () => openExtURL("https://www.instagram.com/" + encodeURIComponent(handle) + "/"),
-        "正在打开 Instagram…");
+      if (handle) {
+        const igFallback = () => openExtURL("https://www.instagram.com/" + encodeURIComponent(handle) + "/");
+        if (isAndroid) {
+          openAppScheme(
+            androidIntentURL("instagram", `user?username=${encodeURIComponent(handle)}`, "com.instagram.android",
+              "https://www.instagram.com/" + encodeURIComponent(handle) + "/"),
+            igFallback, "正在打开 Instagram…");
+        } else {
+          openAppScheme(`instagram://user?username=${encodeURIComponent(handle)}`, igFallback, "正在打开 Instagram…");
+        }
+      }
       return;
     }
     if (typeLower === "twitter") {
       const handle = clean.replace(/^@/, "").replace(/https?:\/\/(www\.)?(twitter|x)\.com\//i, "").replace(/\/$/, "");
-      if (handle) openAppScheme(
-        `twitter://user?screen_name=${encodeURIComponent(handle)}`,
-        () => openExtURL("https://x.com/" + encodeURIComponent(handle)),
-        "正在打开 X / Twitter…");
+      if (handle) {
+        const twFallback = () => openExtURL("https://x.com/" + encodeURIComponent(handle));
+        if (isAndroid) {
+          openAppScheme(
+            androidIntentURL("twitter", `user?screen_name=${encodeURIComponent(handle)}`, "com.twitter.android",
+              "https://x.com/" + encodeURIComponent(handle)),
+            twFallback, "正在打开 X / Twitter…");
+        } else {
+          openAppScheme(`twitter://user?screen_name=${encodeURIComponent(handle)}`, twFallback, "正在打开 X / Twitter…");
+        }
+      }
       return;
     }
     if (typeLower === "tiktok") {

@@ -2,7 +2,7 @@
    策略：同源 GET 请求一律 network-first（在线拿最新，离线回退缓存）。
    所有 Google API / OAuth 域名直接放行，绝不缓存。
    更新方式：改代码后把 CACHE 版本号 +1 即可强制刷新缓存。 */
-const CACHE = "crm-v5-pwa-v6";
+const CACHE = "crm-v5-pwa-v7";
 const PRECACHE = [
   "./",
   "./index.html",
