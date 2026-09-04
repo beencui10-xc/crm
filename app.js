@@ -83,7 +83,7 @@
   };
 
   // Google Drive API config
-  const GOOGLE_SCOPES = "https://www.googleapis.com/auth/drive.file";
+  const GOOGLE_SCOPES = ["https://www.googleapis.com/auth/drive.file"];
 
   // OneDrive API config
   const ONEDRIVE_REDIRECT_URI = window.location.origin;
@@ -352,48 +352,86 @@
       return false;
     }
 
-    try {
-      // Use OAuth2.0 implicit flow for Google Drive
-      const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?` +
-        `client_id=${encodeURIComponent(googleDriveConfig.clientId)}` +
-        `&redirect_uri=${encodeURIComponent(window.location.origin)}` +
-        `&response_type=token` +
-        `&scope=${encodeURIComponent(GOOGLE_SCOPES)}` +
-        `&prompt=consent`;
+    const scopesStr = GOOGLE_SCOPES.join(" ");
+    // Use full path including /crm/ subdirectory
+    const redirectUri = window.location.origin + "/crm/";
+    const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?` +
+      `client_id=${encodeURIComponent(googleDriveConfig.clientId)}` +
+      `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+      `&response_type=token` +
+      `&scope=${encodeURIComponent(scopesStr)}` +
+      `&prompt=consent`;
 
-      // Open popup for authentication
-      const popup = window.open(authUrl, "googleAuth", "width=500,height=600");
+    // Check if we're returning from OAuth (token in URL hash)
+    if (window.location.hash.includes("access_token")) {
+      const params = new URLSearchParams(window.location.hash.substring(1));
+      const accessToken = params.get("access_token");
+      if (accessToken) {
+        cloudStorage.googleToken = {
+          access_token: accessToken,
+          expires_at: Date.now() + (parseInt(params.get("expires_in")) || 3600) * 1000,
+        };
+        await idbPut(GOOGLE_DRIVE_TOKEN_KEY, cloudStorage.googleToken);
+        // Clean URL
+        window.history.replaceState({}, document.title, window.location.pathname);
+        toast("Google Drive 认证成功", "success");
+        return true;
+      }
+    }
 
-      // Listen for the redirect
-      return new Promise((resolve) => {
-        const authTimer = setInterval(() => {
-          try {
-            if (popup.closed) {
-              clearInterval(authTimer);
-              resolve(false);
-              return;
-            }
-            const url = popup.location.href;
-            if (url.includes("#")) {
-              const params = new URLSearchParams(url.split("#")[1]);
-              const accessToken = params.get("access_token");
-              if (accessToken) {
-                cloudStorage.googleToken = {
-                  access_token: accessToken,
-                  expires_at: Date.now() + (parseInt(params.get("expires_in")) || 3600) * 1000,
-                };
-                idbPut(GOOGLE_DRIVE_TOKEN_KEY, cloudStorage.googleToken);
-                popup.close();
+    // Detect if mobile browser
+    const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+
+    if (isMobile) {
+      // Mobile: redirect in same window
+      window.location.href = authUrl;
+      return false; // Will reload page
+    } else {
+      // Desktop: try popup first, fallback to redirect
+      try {
+        const popup = window.open(authUrl, "googleAuth", "width=500,height=600");
+        if (!popup || popup.closed) {
+          // Popup blocked, use redirect
+          window.location.href = authUrl;
+          return false;
+        }
+
+        return new Promise((resolve) => {
+          const authTimer = setInterval(() => {
+            try {
+              if (popup.closed) {
                 clearInterval(authTimer);
-                toast("Google Drive 认证成功", "success");
-                resolve(true);
+                resolve(false);
+                return;
               }
+              const url = popup.location.href;
+              if (url.includes("#") && url.includes("access_token")) {
+                const params = new URLSearchParams(url.split("#")[1]);
+                const accessToken = params.get("access_token");
+                if (accessToken) {
+                  cloudStorage.googleToken = {
+                    access_token: accessToken,
+                    expires_at: Date.now() + (parseInt(params.get("expires_in")) || 3600) * 1000,
+                  };
+                  idbPut(GOOGLE_DRIVE_TOKEN_KEY, cloudStorage.googleToken);
+                  popup.close();
+                  clearInterval(authTimer);
+                  toast("Google Drive 认证成功", "success");
+                  resolve(true);
+                }
+              }
+            } catch (e) {
+              // Cross-origin, waiting
             }
-          } catch (e) {
-            // Cross-origin, waiting for redirect
-          }
-        }, 500);
-      });
+          }, 500);
+        });
+      } catch (e) {
+        // Popup failed, use redirect
+        window.location.href = authUrl;
+        return false;
+      }
+    }
+  }
     } catch (e) {
       console.error("Google Drive auth failed", e);
       toast("Google Drive 认证失败: " + e.message, "error");
@@ -2713,6 +2751,21 @@
   async function init() {
     // V4: open IndexedDB first
     try { await idbOpen(); } catch (e) { console.warn("IDB open failed", e); }
+
+    // Check if returning from OAuth redirect
+    if (window.location.hash.includes("access_token")) {
+      try {
+        await loadCloudStorageState();
+        const success = await authenticateGoogleDrive();
+        if (success) {
+          // Reload to clean state
+          window.location.reload();
+          return;
+        }
+      } catch (e) {
+        console.warn("OAuth redirect handling failed:", e);
+      }
+    }
 
     // Bind all button events
     try {
