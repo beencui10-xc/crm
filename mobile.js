@@ -416,7 +416,9 @@
       el.addEventListener("click", () => {
         const i = parseInt(el.dataset.i);
         mContactAction(c, i);
-        markContacted(c, i);
+        // defer the re-render so it can't interrupt the pending OS jump
+        // inside the same user gesture (observed to break deep links on phones)
+        setTimeout(() => markContacted(c, i), 600);
       });
     });
     // 标记今日 (no external action)
@@ -438,9 +440,30 @@
   }
 
   /* ------- mobile deep-link actions (phone OS opens the right app) ------- */
+  function anchorClick(u, newTab) {
+    // <a> click survives where window.open is blocked (iOS PWA standalone).
+    const a = document.createElement("a");
+    a.href = u;
+    if (newTab) { a.target = "_blank"; a.rel = "noopener"; }
+    a.style.display = "none";
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => a.remove(), 0);
+  }
   function openExtURL(u) {
-    // new tab — system routes https App Links / Universal Links to the installed app
-    window.open(u, "_blank");
+    // window.open is SILENTLY blocked in PWA standalone windows (esp. iOS),
+    // returning null — desktop browsers are fine, which is why CDP tests passed.
+    // Double-insurance: try window.open first, fall back to <a target="_blank">.
+    let w = null;
+    try { w = window.open(u, "_blank"); } catch (e) { /* blocked */ }
+    if (!w) anchorClick(u, true);
+  }
+  function openScheme(u, msg) {
+    // mailto: / tel: — system protocol, location.href triggers the OS app
+    // chooser; anchor-click as fallback for restrictive Android WebViews.
+    try { window.location.href = u; }
+    catch (e) { anchorClick(u, false); }
+    if (msg) api.toast(msg, "success");
   }
   function ensureURL(u) {
     u = String(u || "").trim();
@@ -457,8 +480,9 @@
     // ---- Email → mailto: 手机系统自动弹出邮箱应用选择器 ----
     if (detected === "Email") {
       const subject = c && c.Company ? `${c.Company} — 跟进` : "客户跟进";
-      window.location.href = `mailto:${encodeURIComponent(clean)}?subject=${encodeURIComponent(subject)}`;
-      api.toast("正在打开邮箱应用…", "success");
+      copyText(clean);
+      openScheme(`mailto:${encodeURIComponent(clean)}?subject=${encodeURIComponent(subject)}`,
+        "邮箱已复制 · 正在打开邮箱应用…");
       return;
     }
     // ---- WhatsApp → wa.me（Universal Link，自动唤起 WhatsApp 到该联系人）----
@@ -467,39 +491,43 @@
       if (!digits) { api.toast("无法识别 WhatsApp 号码", "error"); return; }
       copyText(clean);
       openExtURL(`https://wa.me/${digits}`);
+      api.toast("正在打开 WhatsApp…", "success");
       return;
     }
     // ---- Phone → tel: 跳转拨号盘 ----
     if (detected === "Phone" || typeLower === "phone") {
       const tel = clean.replace(/[^\d+]/g, "");
       if (!tel) { api.toast("无法识别电话号码", "error"); return; }
-      window.location.href = `tel:${tel}`;
+      openScheme(`tel:${tel}`, "正在打开拨号…");
       return;
     }
     // ---- 社媒平台：打开 https 链接，系统自动路由到已安装的 App ----
     if (typeLower === "linkedin" || /^linkedin/i.test(detected)) {
       if (/linkedin\.com/i.test(clean)) openExtURL(ensureURL(clean));
       else openExtURL("https://www.linkedin.com/search/results/all/?keywords=" + encodeURIComponent(clean));
+      api.toast("正在打开 LinkedIn…", "success");
       return;
     }
     if (typeLower === "facebook") {
       if (/facebook\.com|fb\.com/i.test(clean)) openExtURL(ensureURL(clean));
       else openExtURL("https://www.facebook.com/search/top?q=" + encodeURIComponent(clean));
+      api.toast("正在打开 Facebook…", "success");
       return;
     }
     if (typeLower === "instagram") {
       const handle = clean.replace(/^@/, "").replace(/https?:\/\/(www\.)?instagram\.com\//i, "").replace(/\/$/, "");
-      if (handle) openExtURL("https://www.instagram.com/" + encodeURIComponent(handle) + "/");
+      if (handle) { openExtURL("https://www.instagram.com/" + encodeURIComponent(handle) + "/"); api.toast("正在打开 Instagram…", "success"); }
       return;
     }
     if (typeLower === "twitter") {
       const handle = clean.replace(/^@/, "").replace(/https?:\/\/(www\.)?(twitter|x)\.com\//i, "").replace(/\/$/, "");
-      if (handle) openExtURL("https://x.com/" + encodeURIComponent(handle));
+      if (handle) { openExtURL("https://x.com/" + encodeURIComponent(handle)); api.toast("正在打开 X / Twitter…", "success"); }
       return;
     }
     if (typeLower === "tiktok") {
       if (/tiktok\.com/i.test(clean)) openExtURL(ensureURL(clean));
       else openExtURL("https://www.tiktok.com/search?q=" + encodeURIComponent(clean));
+      api.toast("正在打开 TikTok…", "success");
       return;
     }
     if (typeLower === "wechat") {
@@ -508,7 +536,7 @@
       return;
     }
     // ---- Website → 浏览器打开 ----
-    if (detected === "Website") { openExtURL(ensureURL(clean)); return; }
+    if (detected === "Website") { openExtURL(ensureURL(clean)); api.toast("正在打开网站…", "success"); return; }
     // ---- Others: 复制兜底 ----
     copyText(clean);
     api.toast("内容已复制", "success");
