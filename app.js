@@ -179,6 +179,167 @@
   }
 
   /* ============================================================
+     V4 — Open File from Cloud Storage
+     ============================================================ */
+  async function openGoogleDriveFile() {
+    if (!cloudStorage.googleToken || !cloudStorage.googleToken.access_token) {
+      toast("请先登录 Google Drive", "error");
+      return;
+    }
+
+    try {
+      // List Excel files in Google Drive
+      let query = "mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' or mimeType='application/vnd.ms-excel'";
+      if (cloudStorage.googleFolderId) {
+        query += ` and '${cloudStorage.googleFolderId}' in parents`;
+      }
+
+      const response = await fetch(
+        `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id,name,modifiedTime)&orderBy=modifiedTime desc&pageSize=20`,
+        {
+          headers: {
+            "Authorization": `Bearer ${cloudStorage.googleToken.access_token}`,
+          },
+        }
+      );
+
+      if (!response.ok) throw new Error("Failed to list files");
+
+      const result = await response.json();
+      if (!result.files || result.files.length === 0) {
+        toast("Google Drive 中没有找到 Excel 文件", "error");
+        return;
+      }
+
+      // Show file picker modal
+      showCloudFilePicker(result.files, "Google Drive", async (file) => {
+        // Download and import the file
+        const downloadResponse = await fetch(
+          `https://www.googleapis.com/drive/v3/files/${file.id}?alt=media`,
+          {
+            headers: {
+              "Authorization": `Bearer ${cloudStorage.googleToken.access_token}`,
+            },
+          }
+        );
+
+        if (!downloadResponse.ok) throw new Error("Failed to download file");
+
+        const blob = await downloadResponse.blob();
+        const fileObj = new File([blob], file.name, { type: blob.type });
+        importExcel(fileObj);
+        toast(`已从 Google Drive 打开: ${file.name}`, "success");
+      });
+    } catch (e) {
+      console.error("Open from Google Drive failed", e);
+      toast("打开 Google Drive 文件失败: " + e.message, "error");
+    }
+  }
+
+  async function openOneDriveFile() {
+    if (!cloudStorage.onedriveToken || !cloudStorage.onedriveToken.access_token) {
+      toast("请先登录 OneDrive", "error");
+      return;
+    }
+
+    try {
+      // List Excel files in OneDrive
+      const accessToken = await getOneDriveToken();
+      if (!accessToken) {
+        toast("OneDrive token 获取失败", "error");
+        return;
+      }
+
+      const response = await fetch(
+        `https://graph.microsoft.com/v1.0/me/drive/root/children?$filter=file.mimeType eq 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' or file.mimeType eq 'application/vnd.ms-excel'&$top=20&$orderby=lastModifiedDateTime desc`,
+        {
+          headers: {
+            "Authorization": `Bearer ${accessToken}`,
+          },
+        }
+      );
+
+      if (!response.ok) throw new Error("Failed to list files");
+
+      const result = await response.json();
+      if (!result.value || result.value.length === 0) {
+        toast("OneDrive 中没有找到 Excel 文件", "error");
+        return;
+      }
+
+      // Show file picker modal
+      showCloudFilePicker(result.value, "OneDrive", async (file) => {
+        // Download and import the file
+        const downloadResponse = await fetch(
+          `https://graph.microsoft.com/v1.0/me/drive/items/${file.id}/content`,
+          {
+            headers: {
+              "Authorization": `Bearer ${accessToken}`,
+            },
+          }
+        );
+
+        if (!downloadResponse.ok) throw new Error("Failed to download file");
+
+        const blob = await downloadResponse.blob();
+        const fileObj = new File([blob], file.name, { type: blob.type });
+        importExcel(fileObj);
+        toast(`已从 OneDrive 打开: ${file.name}`, "success");
+      });
+    } catch (e) {
+      console.error("Open from OneDrive failed", e);
+      toast("打开 OneDrive 文件失败: " + e.message, "error");
+    }
+  }
+
+  function showCloudFilePicker(files, providerName, onSelect) {
+    const modal = document.createElement("div");
+    modal.className = "modal-backdrop";
+    modal.innerHTML = `
+      <div class="modal" style="width: 500px; max-height: 70vh;">
+        <div class="modal-header">
+          <span class="modal-title">从 ${providerName} 打开</span>
+          <button class="modal-close" onclick="this.closest('.modal-backdrop').remove()">×</button>
+        </div>
+        <div class="modal-body" style="max-height: 50vh; overflow-y: auto;">
+          ${files.map(f => `
+            <div class="cloud-file-item" style="
+              padding: 10px 12px; border: 1px solid var(--border); border-radius: 6px;
+              margin-bottom: 6px; cursor: pointer; display: flex; justify-content: space-between;
+              align-items: center; transition: all 0.15s;
+            ">
+              <div>
+                <div style="font-weight: 600; font-size: 13px;">📄 ${escapeHtml(f.name)}</div>
+                <div style="font-size: 11px; color: var(--ink-faint);">
+                  ${f.modifiedTime ? new Date(f.modifiedTime).toLocaleString() : ''}
+                </div>
+              </div>
+              <button class="sbtn small">打开</button>
+            </div>
+          `).join("")}
+        </div>
+      </div>
+    `;
+
+    document.body.appendChild(modal);
+
+    // Bind click events
+    modal.querySelectorAll(".cloud-file-item").forEach((item, i) => {
+      item.onmouseover = () => item.style.background = "rgba(37,99,235,0.05)";
+      item.onmouseout = () => item.style.background = "";
+      item.querySelector(".sbtn").onclick = () => {
+        modal.remove();
+        onSelect(files[i]);
+      };
+    });
+
+    // Close on backdrop click
+    modal.onclick = (e) => {
+      if (e.target === modal) modal.remove();
+    };
+  }
+
+  /* ============================================================
      V4 — Google Drive Integration
      ============================================================ */
   function isGoogleDriveConfigured() {
@@ -338,9 +499,31 @@
 
   let msalInstance = null;
 
+  // Dynamically load MSAL library
+  async function loadMsalLibrary() {
+    if (typeof msal !== 'undefined') return true;
+    return new Promise((resolve) => {
+      const script = document.createElement('script');
+      script.src = 'https://alcdn.msauth.net/browser/2.38.3/js/msal-browser.min.js';
+      script.onload = () => resolve(true);
+      script.onerror = () => {
+        console.warn('MSAL load failed');
+        resolve(false);
+      };
+      document.head.appendChild(script);
+    });
+  }
+
   async function authenticateOneDrive() {
     if (!isOneDriveConfigured()) {
       toast("请先在配置中填写 OneDrive 的 Client ID", "error");
+      return false;
+    }
+
+    // Load MSAL library if not loaded
+    const msalLoaded = await loadMsalLibrary();
+    if (!msalLoaded || typeof msal === 'undefined') {
+      toast("OneDrive 库加载失败，请检查网络连接后重试", "error");
       return false;
     }
 
@@ -2223,80 +2406,92 @@
       return;
     }
 
-    // Check if the selected cloud storage is configured
-    if (cloudStorage.provider === "local" && !workingDirHandle) {
-      if (!silent) toast("请先在「配置」中选择工作文件夹", "error");
-      return;
-    }
-    if (cloudStorage.provider === "google" && !cloudStorage.googleToken) {
-      if (!silent) toast("请先在「配置」中登录 Google Drive", "error");
-      return;
-    }
-    if (cloudStorage.provider === "onedrive" && !cloudStorage.onedriveToken) {
-      if (!silent) toast("请先在「配置」中登录 OneDrive", "error");
-      return;
-    }
+    // Generate new filename with timestamp
+    const now = new Date();
+    const ts = now.toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const newFileName = `客户总表_自动保存_${ts}.xlsx`;
 
-    try {
-      // Build workbook and save
-      const wb = buildWorkbook();
-      const buf = XLSX.write(wb, { type: "array", bookType: "xlsx" });
+    // Build workbook and save
+    const wb = buildWorkbook();
+    const buf = XLSX.write(wb, { type: "array", bookType: "xlsx" });
 
-      // Generate new filename with timestamp
-      const now = new Date();
-      const ts = now.toISOString().replace(/[:.]/g, "-").slice(0, 19);
-      const newFileName = `客户总表_自动保存_${ts}.xlsx`;
+    const savedLocations = [];
+    const failedLocations = [];
 
-      let success = false;
-      let location = "";
-
-      // Save based on selected cloud provider
-      switch (cloudStorage.provider) {
-        case "local":
-          // Check permission
-          const ok = await ensureWorkingFolderPermission();
-          if (!ok) {
-            if (!silent) toast("工作文件夹权限未授予，请重新选择文件夹", "error");
-            return;
-          }
-          // Delete previous auto-save file first
+    // 1. Save to local folder (if available)
+    if (workingDirHandle) {
+      try {
+        const ok = await ensureWorkingFolderPermission();
+        if (ok) {
           await deletePreviousAutoSave();
-          // Save to local folder
           const fileHandle = await workingDirHandle.getFileHandle(newFileName, { create: true });
           const writable = await fileHandle.createWritable();
           await writable.write(buf);
           await writable.close();
-          success = true;
-          location = workingDirHandle.name;
-          break;
-
-        case "google":
-          // Delete previous file and upload to Google Drive
-          success = await googleDriveUpload(newFileName, buf);
-          location = "Google Drive";
-          break;
-
-        case "onedrive":
-          // Delete previous file and upload to OneDrive
-          success = await onedriveUpload(newFileName, buf);
-          location = "OneDrive";
-          break;
+          savedLocations.push(workingDirHandle.name);
+        }
+      } catch (e) {
+        console.warn("Local save failed", e);
+        failedLocations.push("本地");
       }
-
-      if (success) {
-        // Update tracking state
-        currentAutoSaveFileName = newFileName;
-        await idbPut(LAST_SAVE_NAME_KEY, newFileName);
-
-        state.dirty = false;
-        lastAutoSaveTime = now.toLocaleString();
-        saveToLocal();
-        if (!silent) toast(`已保存到 ${location}/${newFileName}`, "success");
-        updateWorkingFolderStatusUI();
+    } else if (state.fileName && typeof state.fileHandle !== 'undefined' && state.fileHandle) {
+      // Use the folder from the opened file as default
+      try {
+        const parentDir = await state.fileHandle.getFile();
+        // Note: Can't get parent directory from file handle, skip
+      } catch (e) {
+        // Ignore
       }
-    } catch (e) {
-      console.warn("auto save failed", e);
-      if (!silent) toast("保存失败：" + e.message, "error");
+    }
+
+    // 2. Save to cloud (if configured)
+    if (cloudStorage.provider === "google" && cloudStorage.googleToken) {
+      try {
+        // Delete previous cloud file
+        if (currentAutoSaveFileName) {
+          await googleDriveDeleteFile(currentAutoSaveFileName);
+        }
+        const success = await googleDriveUpload(newFileName, buf);
+        if (success) savedLocations.push("Google Drive");
+        else failedLocations.push("Google Drive");
+      } catch (e) {
+        console.warn("Google Drive save failed", e);
+        failedLocations.push("Google Drive");
+      }
+    }
+
+    if (cloudStorage.provider === "onedrive" && cloudStorage.onedriveToken) {
+      try {
+        // Delete previous cloud file
+        if (currentAutoSaveFileName) {
+          await onedriveDeleteFile(currentAutoSaveFileName);
+        }
+        const success = await onedriveUpload(newFileName, buf);
+        if (success) savedLocations.push("OneDrive");
+        else failedLocations.push("OneDrive");
+      } catch (e) {
+        console.warn("OneDrive save failed", e);
+        failedLocations.push("OneDrive");
+      }
+    }
+
+    // Update state if any save succeeded
+    if (savedLocations.length > 0) {
+      currentAutoSaveFileName = newFileName;
+      await idbPut(LAST_SAVE_NAME_KEY, newFileName);
+      state.dirty = false;
+      lastAutoSaveTime = now.toLocaleString();
+      saveToLocal();
+      if (!silent) {
+        let msg = `已保存到: ${savedLocations.join(", ")}`;
+        if (failedLocations.length > 0) {
+          msg += ` (失败: ${failedLocations.join(", ")})`;
+        }
+        toast(msg, "success");
+      }
+      updateWorkingFolderStatusUI();
+    } else if (!silent && failedLocations.length > 0) {
+      toast(`保存失败: ${failedLocations.join(", ")}`, "error");
     }
   }
 
@@ -2313,75 +2508,78 @@
 
     let html = "";
 
-    // Cloud storage selector
-    html += `<div style="margin-bottom:12px;">
-      <label style="font-weight:700;color:var(--ink);font-size:13px;">保存位置：</label>
-      <select id="cloudProviderSelect" style="height:30px;padding:0 8px;border:1px solid var(--border);border-radius:6px;background:#fff;color:var(--ink);font-size:12px;margin-left:8px;">
-        <option value="local" ${cloudStorage.provider === "local" ? "selected" : ""}>📁 本地文件夹</option>
-        <option value="google" ${cloudStorage.provider === "google" ? "selected" : ""}>☁️ Google Drive</option>
-        <option value="onedrive" ${cloudStorage.provider === "onedrive" ? "selected" : ""}>🔷 OneDrive</option>
-      </select>
+    // Main status - show what's configured
+    html += `<div style="margin-bottom:10px;">`;
+
+    // Local folder status
+    html += `<div style="margin-bottom:6px;">
+      <b>📁 本地文件夹：</b>
+      ${workingDirHandle
+        ? `<span class="bk-folder">${escapeHtml(workingDirHandle.name)}</span>`
+        : '<span class="bk-warn">未设置</span>'}
     </div>`;
 
-    // Status based on selected provider
-    switch (cloudStorage.provider) {
-      case "local":
-        if (!fsaSupported()) {
-          html += `<span class="bk-warn">当前浏览器不支持自动保存到文件夹，请用「保存导出」手动备份，或换用 Chrome / Edge。</span>`;
-        } else if (workingDirHandle) {
-          html += `工作文件夹：<span class="bk-folder">${escapeHtml(workingDirHandle.name)}</span><br>
-            自动保存文件：<b>客户总表_自动保存_时间戳.xlsx</b>（每次保存前删除旧文件）<br>
-            上次保存：${lastAutoSaveTime ? `<b>${escapeHtml(lastAutoSaveTime)}</b>` : '<span class="bk-warn">尚未保存</span>'}<br>
-            <span style="color:var(--ink-faint)">每30分钟自动检测，有更新才保存。刷新页面后首次保存可能需重新授权。</span>`;
-        } else {
-          html += `<span class="bk-warn">未设置工作文件夹</span><br>点击下方「选择工作文件夹」按钮选择一个目录。`;
-        }
-        break;
-
-      case "google":
-        if (!isGoogleDriveConfigured()) {
-          html += `<span class="bk-warn">Google Drive 未配置</span><br>
-            请在下方「Google Drive 配置」区域填写 Client ID 和 API Key。<br>
-            <span style="color:var(--ink-faint)">点击下方「显示 Google 配置」按钮展开配置区域。</span>`;
-        } else if (cloudStorage.googleToken) {
-          html += `已登录 Google Drive<br>
-            自动保存文件：<b>客户总表_自动保存_时间戳.xlsx</b><br>
-            上次保存：${lastAutoSaveTime ? `<b>${escapeHtml(lastAutoSaveTime)}</b>` : '<span class="bk-warn">尚未保存</span>'}<br>
-            <span style="color:var(--ink-faint)">每30分钟自动检测，有更新才保存。</span>`;
-        } else {
-          html += `<span class="bk-warn">未登录 Google Drive</span><br>点击下方「登录 Google Drive」按钮进行认证。`;
-        }
-        break;
-
-      case "onedrive":
-        if (!isOneDriveConfigured()) {
-          html += `<span class="bk-warn">OneDrive 未配置</span><br>
-            请在下方「OneDrive 配置」区域填写 Client ID。<br>
-            <span style="color:var(--ink-faint)">点击下方「显示 OneDrive 配置」按钮展开配置区域。</span>`;
-        } else if (cloudStorage.onedriveToken) {
-          html += `已登录 OneDrive<br>
-            自动保存文件：<b>客户总表_自动保存_时间戳.xlsx</b><br>
-            上次保存：${lastAutoSaveTime ? `<b>${escapeHtml(lastAutoSaveTime)}</b>` : '<span class="bk-warn">尚未保存</span>'}<br>
-            <span style="color:var(--ink-faint)">每30分钟自动检测，有更新才保存。</span>`;
-        } else {
-          html += `<span class="bk-warn">未登录 OneDrive</span><br>点击下方「登录 OneDrive」按钮进行认证。`;
-        }
-        break;
+    // Cloud storage status
+    html += `<div style="margin-bottom:6px;">
+      <b>☁️ 网盘同步：</b>`;
+    if (cloudStorage.googleToken) {
+      html += `<span style="color:var(--success);">Google Drive 已连接</span>`;
+    } else if (cloudStorage.onedriveToken) {
+      html += `<span style="color:var(--success);">OneDrive 已连接</span>`;
+    } else {
+      html += `<span class="bk-warn">未连接</span>`;
     }
+    html += `</div>`;
+
+    // Auto-save info
+    html += `<div style="font-size:11px;color:var(--ink-faint);margin-top:8px;padding:6px 8px;background:rgba(30,50,90,0.03);border-radius:4px;">
+      <b style="color:var(--ink-dim);">自动保存说明：</b><br>
+      • 每30分钟自动保存一次（有更新时）<br>
+      • 本地文件夹：保存到 <b>客户总表_自动保存_时间戳.xlsx</b>，每次保存前删除旧文件<br>
+      • 网盘：同步保存到已连接的云盘<br>
+      • ${workingDirHandle ? '上次保存：' + (lastAutoSaveTime ? `<b>${escapeHtml(lastAutoSaveTime)}</b>` : '<span class="bk-warn">尚未保存</span>') : '请先选择本地文件夹'}
+    </div>`;
+    html += `</div>`;
+
+    // Cloud storage selector for connecting/disconnecting
+    html += `<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);">
+      <label style="font-weight:700;color:var(--ink);font-size:12px;">连接网盘账号：</label>
+      <select id="cloudProviderSelect" style="height:28px;padding:0 8px;border:1px solid var(--border);border-radius:6px;background:#fff;color:var(--ink);font-size:11px;margin-left:6px;">
+        <option value="none" ${!cloudStorage.googleToken && !cloudStorage.onedriveToken ? "selected" : ""}>不连接</option>
+        <option value="google" ${cloudStorage.googleToken ? "selected" : ""}>Google Drive</option>
+        <option value="onedrive" ${cloudStorage.onedriveToken ? "selected" : ""}>OneDrive</option>
+      </select>
+    </div>`;
 
     el.innerHTML = html;
 
     // Show/hide config sections based on provider
     const googleSection = $("googleDriveConfigSection");
     const onedriveSection = $("oneDriveConfigSection");
-    if (googleSection) googleSection.style.display = cloudStorage.provider === "google" ? "block" : "none";
-    if (onedriveSection) onedriveSection.style.display = cloudStorage.provider === "onedrive" ? "block" : "none";
+    if (googleSection) googleSection.style.display = (cloudStorage.provider === "google" && !cloudStorage.googleToken) ? "block" : "none";
+    if (onedriveSection) onedriveSection.style.display = (cloudStorage.provider === "onedrive" && !cloudStorage.onedriveToken) ? "block" : "none";
 
     // Bind cloud provider selector
     const providerSelect = $("cloudProviderSelect");
     if (providerSelect) {
       providerSelect.addEventListener("change", async () => {
-        cloudStorage.provider = providerSelect.value;
+        const val = providerSelect.value;
+        if (val === "none") {
+          // Disconnect cloud
+          if (cloudStorage.googleToken) {
+            cloudStorage.googleToken = null;
+            await idbDel(GOOGLE_DRIVE_TOKEN_KEY);
+          }
+          if (cloudStorage.onedriveToken) {
+            cloudStorage.onedriveToken = null;
+            await idbDel(ONEDRIVE_TOKEN_KEY);
+            if (msalInstance) msalInstance.logoutPopup();
+          }
+          cloudStorage.provider = "local";
+          toast("已断开网盘连接", "success");
+        } else {
+          cloudStorage.provider = val;
+        }
         await saveCloudStorageState();
         updateWorkingFolderStatusUI();
         updateCloudButtons();
@@ -2426,40 +2624,25 @@
 
     let buttonsHtml = "";
 
-    switch (cloudStorage.provider) {
-      case "local":
-        buttonsHtml = `
-          <button class="sbtn small" id="btnPickBackup">选择工作文件夹</button>
-          <button class="sbtn small success" id="btnBackupNow">立即保存</button>
-          <button class="sbtn small ghost" id="btnClearBackup">取消自动保存</button>
-        `;
-        break;
+    // Always show local folder selector
+    buttonsHtml += `<button class="sbtn small" id="btnPickBackup">${workingDirHandle ? '更换' : '选择'}工作文件夹</button>`;
 
-      case "google":
-        if (cloudStorage.googleToken) {
-          buttonsHtml = `
-            <button class="sbtn small success" id="btnBackupNow">立即保存</button>
-            <button class="sbtn small ghost" id="btnClearBackup">退出登录</button>
-          `;
-        } else {
-          buttonsHtml = `
-            <button class="sbtn small" id="btnGoogleLogin">登录 Google Drive</button>
-          `;
-        }
-        break;
+    // Show cloud login buttons if not connected
+    if (!cloudStorage.googleToken && !cloudStorage.onedriveToken) {
+      if (isGoogleDriveConfigured()) {
+        buttonsHtml += `<button class="sbtn small" id="btnGoogleLogin">登录 Google Drive</button>`;
+      }
+      if (isOneDriveConfigured()) {
+        buttonsHtml += `<button class="sbtn small" id="btnOneDriveLogin">登录 OneDrive</button>`;
+      }
+    }
 
-      case "onedrive":
-        if (cloudStorage.onedriveToken) {
-          buttonsHtml = `
-            <button class="sbtn small success" id="btnBackupNow">立即保存</button>
-            <button class="sbtn small ghost" id="btnClearBackup">退出登录</button>
-          `;
-        } else {
-          buttonsHtml = `
-            <button class="sbtn small" id="btnOneDriveLogin">登录 OneDrive</button>
-          `;
-        }
-        break;
+    // Always show save now button
+    buttonsHtml += `<button class="sbtn small success" id="btnBackupNow">立即保存</button>`;
+
+    // Show stop button if auto-save is active
+    if (workingDirHandle || cloudStorage.googleToken || cloudStorage.onedriveToken) {
+      buttonsHtml += `<button class="sbtn small ghost" id="btnClearBackup">停止自动保存</button>`;
     }
 
     actionsEl.innerHTML = buttonsHtml;
@@ -2477,6 +2660,7 @@
     if (btnGoogleLogin) btnGoogleLogin.onclick = async () => {
       const success = await authenticateGoogleDrive();
       if (success) {
+        toast("Google Drive 已连接，将同时保存到本地和云端", "success");
         updateWorkingFolderStatusUI();
         updateCloudButtons();
       }
@@ -2484,6 +2668,7 @@
     if (btnOneDriveLogin) btnOneDriveLogin.onclick = async () => {
       const success = await authenticateOneDrive();
       if (success) {
+        toast("OneDrive 已连接，将同时保存到本地和云端", "success");
         updateWorkingFolderStatusUI();
         updateCloudButtons();
       }
@@ -2513,7 +2698,6 @@
     updateWorkingFolderStatusUI();
     updateCloudButtons();
   }
-
   /* ============================================================
      INIT & EVENT WIRING
      ============================================================ */
@@ -2521,73 +2705,148 @@
     // V4: open IndexedDB first
     try { await idbOpen(); } catch (e) { console.warn("IDB open failed", e); }
 
-    $("btnOpen").addEventListener("click", () => $("fileInput").click());
-    $("fileInput").addEventListener("change", (e) => {
-      if (e.target.files[0]) importExcel(e.target.files[0]);
-      e.target.value = "";
-    });
-    $("btnSave").addEventListener("click", exportExcel);
-    $("btnImport").addEventListener("click", batchImport);
-    $("btnNew").addEventListener("click", newCustomer);
-    $("btnBatchUpdate").addEventListener("click", batchUpdate);
-    $("btnExportConvert").addEventListener("click", exportToConvertList);
-    $("btnConfig").addEventListener("click", openConfig);
+    // Bind all button events
+    try {
+      // Open file with dropdown
+      $("btnOpen").addEventListener("click", (e) => {
+        e.stopPropagation();
 
-    $("btnSearch").addEventListener("click", applyFilter);
-    $("btnClearSearch").addEventListener("click", () => {
-      $("searchInput").value = "";
-      $("filterCategory").value = "";
-      $("filterRating").value = "";
-      $("filterFollowup").checked = true;
-      applyFilter();
-    });
-    $("searchInput").addEventListener("keydown", (e) => { if (e.key === "Enter") applyFilter(); });
+        // Remove existing menu if any
+        const existingMenu = document.querySelector(".open-dropdown-menu");
+        if (existingMenu) { existingMenu.remove(); return; }
 
-    $("btnPrev").addEventListener("click", gotoPrev);
-    $("btnNext").addEventListener("click", gotoNext);
-    $("gotoRow").addEventListener("keydown", (e) => {
-      if (e.key === "Enter") { const v = parseInt($("gotoRow").value); if (v) gotoRow(v); $("gotoRow").value = ""; }
-    });
+        // Create dropdown menu
+        const menu = document.createElement("div");
+        menu.className = "open-dropdown-menu";
+        menu.style.cssText = `
+          position: absolute; top: 100%; left: 0; z-index: 1000;
+          background: #fff; border: 1px solid var(--border); border-radius: 8px;
+          box-shadow: 0 8px 24px rgba(0,0,0,0.15); min-width: 200px;
+          padding: 6px 0; margin-top: 4px;
+        `;
 
-    // Config modal
-    $("configClose").addEventListener("click", () => { $("configModal").hidden = true; });
-    $("configCancel").addEventListener("click", () => { $("configModal").hidden = true; });
-    $("configSave").addEventListener("click", () => {
-      saveConfig();
-      $("configModal").hidden = true;
-      populateFilterDropdowns();
-      toast("配置已保存", "success");
-    });
+        // Local file option
+        const localOption = document.createElement("div");
+        localOption.className = "dropdown-item";
+        localOption.style.cssText = "padding: 8px 16px; cursor: pointer; font-size: 13px; display: flex; align-items: center; gap: 8px;";
+        localOption.innerHTML = `<span>📁</span><span>打开本地文件</span>`;
+        localOption.onclick = (ev) => { ev.stopPropagation(); menu.remove(); $("fileInput").click(); };
+        menu.appendChild(localOption);
 
-    // Confirm modal
-    $("confirmYes").addEventListener("click", () => {
-      $("confirmModal").hidden = true;
-      if (confirmCallback) confirmCallback();
-      confirmCallback = null;
-    });
-    $("confirmNo").addEventListener("click", () => { $("confirmModal").hidden = true; confirmCallback = null; });
+        // Google Drive option
+        if (cloudStorage.googleToken) {
+          const googleOption = document.createElement("div");
+          googleOption.className = "dropdown-item";
+          googleOption.style.cssText = "padding: 8px 16px; cursor: pointer; font-size: 13px; display: flex; align-items: center; gap: 8px;";
+          googleOption.innerHTML = `<span>☁️</span><span>从 Google Drive 打开</span>`;
+          googleOption.onclick = (ev) => { ev.stopPropagation(); menu.remove(); openGoogleDriveFile(); };
+          menu.appendChild(googleOption);
+        }
 
-    // Keyboard shortcuts
-    document.addEventListener("keydown", (e) => {
-      if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA" || e.target.tagName === "SELECT") return;
-      if (e.key === "ArrowLeft") gotoPrev();
-      if (e.key === "ArrowRight") gotoNext();
-      if (e.key === "n" && e.ctrlKey) { e.preventDefault(); newCustomer(); }
-      if (e.key === "s" && e.ctrlKey) { e.preventDefault(); saveCurrentCustomer(); }
-    });
+        // OneDrive option
+        if (cloudStorage.onedriveToken) {
+          const onedriveOption = document.createElement("div");
+          onedriveOption.className = "dropdown-item";
+          onedriveOption.style.cssText = "padding: 8px 16px; cursor: pointer; font-size: 13px; display: flex; align-items: center; gap: 8px;";
+          onedriveOption.innerHTML = `<span>🔷</span><span>从 OneDrive 打开</span>`;
+          onedriveOption.onclick = (ev) => { ev.stopPropagation(); menu.remove(); openOneDriveFile(); };
+          menu.appendChild(onedriveOption);
+        }
 
-    if (await loadFromLocal()) {
-      renderAll();
-      toast(`已从本地恢复 ${state.customers.length} 条客户数据`, "success");
-    } else {
+        // Position the button relative and append menu
+        $("btnOpen").style.position = "relative";
+        $("btnOpen").appendChild(menu);
+
+        // Close menu when clicking outside (use mousedown to avoid conflicts)
+        const closeMenu = (evt) => {
+          if (!menu.contains(evt.target) && evt.target !== $("btnOpen") && !$("btnOpen").contains(evt.target)) {
+            menu.remove();
+            document.removeEventListener("mousedown", closeMenu);
+          }
+        };
+        setTimeout(() => document.addEventListener("mousedown", closeMenu), 0);
+      });
+
+      $("fileInput").addEventListener("change", (e) => {
+        if (e.target.files[0]) importExcel(e.target.files[0]);
+        e.target.value = "";
+      });
+      $("btnSave").addEventListener("click", exportExcel);
+      $("btnImport").addEventListener("click", batchImport);
+      $("btnNew").addEventListener("click", newCustomer);
+      $("btnBatchUpdate").addEventListener("click", batchUpdate);
+      $("btnExportConvert").addEventListener("click", exportToConvertList);
+      $("btnConfig").addEventListener("click", openConfig);
+
+      $("btnSearch").addEventListener("click", applyFilter);
+      $("btnClearSearch").addEventListener("click", () => {
+        $("searchInput").value = "";
+        $("filterCategory").value = "";
+        $("filterRating").value = "";
+        $("filterFollowup").checked = true;
+        applyFilter();
+      });
+      $("searchInput").addEventListener("keydown", (e) => { if (e.key === "Enter") applyFilter(); });
+
+      $("btnPrev").addEventListener("click", gotoPrev);
+      $("btnNext").addEventListener("click", gotoNext);
+      $("gotoRow").addEventListener("keydown", (e) => {
+        if (e.key === "Enter") { const v = parseInt($("gotoRow").value); if (v) gotoRow(v); $("gotoRow").value = ""; }
+      });
+
+      // Config modal
+      $("configClose").addEventListener("click", () => { $("configModal").hidden = true; });
+      $("configCancel").addEventListener("click", () => { $("configModal").hidden = true; });
+      $("configSave").addEventListener("click", () => {
+        saveConfig();
+        $("configModal").hidden = true;
+        populateFilterDropdowns();
+        toast("配置已保存", "success");
+      });
+
+      // Confirm modal
+      $("confirmYes").addEventListener("click", () => {
+        $("confirmModal").hidden = true;
+        if (confirmCallback) confirmCallback();
+        confirmCallback = null;
+      });
+      $("confirmNo").addEventListener("click", () => { $("confirmModal").hidden = true; confirmCallback = null; });
+
+      // Keyboard shortcuts
+      document.addEventListener("keydown", (e) => {
+        if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA" || e.target.tagName === "SELECT") return;
+        if (e.key === "ArrowLeft") gotoPrev();
+        if (e.key === "ArrowRight") gotoNext();
+        if (e.key === "n" && e.ctrlKey) { e.preventDefault(); newCustomer(); }
+        if (e.key === "s" && e.ctrlKey) { e.preventDefault(); saveCurrentCustomer(); }
+      });
+    } catch (e) {
+      console.error("Event binding failed:", e);
+    }
+
+    // Load data and restore state
+    try {
+      if (await loadFromLocal()) {
+        renderAll();
+        toast(`已从本地恢复 ${state.customers.length} 条客户数据`, "success");
+      } else {
+        populateFilterDropdowns();
+        updateStats();
+      }
+    } catch (e) {
+      console.warn("Load from local failed:", e);
       populateFilterDropdowns();
       updateStats();
     }
 
     // V4: restore working folder handle + start 30-min timer
-    await restoreWorkingFolderHandle();
-    await loadCloudStorageState();
-    startAutoSaveTimer();
+    try {
+      await restoreWorkingFolderHandle();
+      await loadCloudStorageState();
+      startAutoSaveTimer();
+    } catch (e) {
+      console.warn("Cloud storage restore failed:", e);
+    }
 
     window.addEventListener("beforeunload", () => {
       if (state.dirty) {
