@@ -5,7 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>客户跟进管理系统 V5 | Customer Follow-up Management</title>
     <meta name="description" content="客户信息登记、跟进记录、批量处理的网页版管理系统 V5（浅色主题，Google Sheets 云同步）" />
-    <link rel="icon" href="data:," />
+    <link rel="icon" type="image/png" href="icons/icon-64.png" />
+    <link rel="manifest" href="manifest.json" />
+    <meta name="theme-color" content="#4f74e3" />
+    <link rel="apple-touch-icon" href="icons/icon-192.png" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
     <link rel="stylesheet" href="styles.css" />
     <script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
   </head>
@@ -157,5 +162,6 @@
     </div>
 
     <script src="app.js"></script>
+    <script>if ("serviceWorker" in navigator) window.addEventListener("load", function () { navigator.serviceWorker.register("sw.js").catch(function () {}); });</script>
   </body>
 </html>
