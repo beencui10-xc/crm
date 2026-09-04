@@ -440,8 +440,12 @@
   }
 
   /* ------- mobile deep-link actions (phone OS opens the right app) ------- */
+  const isStandalone = () =>
+    window.matchMedia("(display-mode: standalone)").matches ||
+    window.navigator.standalone === true;
+
   function anchorClick(u, newTab) {
-    // <a> click survives where window.open is blocked (iOS PWA standalone).
+    // <a> click survives where window.open is blocked (browser context).
     const a = document.createElement("a");
     a.href = u;
     if (newTab) { a.target = "_blank"; a.rel = "noopener"; }
@@ -451,19 +455,29 @@
     setTimeout(() => a.remove(), 0);
   }
   function openExtURL(u) {
-    // window.open is SILENTLY blocked in PWA standalone windows (esp. iOS),
-    // returning null — desktop browsers are fine, which is why CDP tests passed.
-    // Double-insurance: try window.open first, fall back to <a target="_blank">.
+    // Browser context: window.open first, anchor-click fallback if blocked.
     let w = null;
     try { w = window.open(u, "_blank"); } catch (e) { /* blocked */ }
     if (!w) anchorClick(u, true);
   }
-  function openScheme(u, msg) {
-    // mailto: / tel: — system protocol, location.href triggers the OS app
-    // chooser; anchor-click as fallback for restrictive Android WebViews.
-    try { window.location.href = u; }
-    catch (e) { anchorClick(u, false); }
-    if (msg) api.toast(msg, "success");
+  // Open an app-scheme URL (whatsapp://, fb://, mailto:, tel: …).
+  // Custom schemes are the ONLY reliable way to leave a PWA standalone
+  // window on both iOS and Android — universal links (wa.me etc.) are NOT
+  // routed to apps from standalone windows, and window.open/<a target> are
+  // blocked there. If the OS can't handle the scheme, the page stays
+  // visible (visibilitychange never fires) -> run the fallback.
+  function openAppScheme(schemeUrl, onFail, okMsg) {
+    if (okMsg) api.toast(okMsg, "success");
+    let left = false;
+    const onHide = () => { left = true; };
+    document.addEventListener("visibilitychange", onHide);
+    try { window.location.href = schemeUrl; } catch (e) { /* blocked */ }
+    setTimeout(() => {
+      document.removeEventListener("visibilitychange", onHide);
+      if (!left && document.visibilityState === "visible" && typeof onFail === "function") {
+        onFail();
+      }
+    }, 1200);
   }
   function ensureURL(u) {
     u = String(u || "").trim();
@@ -477,51 +491,81 @@
     const detected = api.detectContactType(clean);
     const typeLower = String(ct.Type || "").toLowerCase();
 
-    // ---- Email → mailto: 手机系统自动弹出邮箱应用选择器 ----
+    // ---- Email → mailto: 系统弹出邮箱应用选择器；失败则地址已复制 ----
     if (detected === "Email") {
       const subject = c && c.Company ? `${c.Company} — 跟进` : "客户跟进";
       copyText(clean);
-      openScheme(`mailto:${encodeURIComponent(clean)}?subject=${encodeURIComponent(subject)}`,
+      openAppScheme(
+        `mailto:${encodeURIComponent(clean)}?subject=${encodeURIComponent(subject)}`,
+        () => api.toast("邮箱地址已复制，请打开邮箱 App 粘贴发送", "success"),
         "邮箱已复制 · 正在打开邮箱应用…");
       return;
     }
-    // ---- WhatsApp → wa.me（Universal Link，自动唤起 WhatsApp 到该联系人）----
+    // ---- WhatsApp → whatsapp:// 协议直达 App（standalone 唯一可靠方式），
+    //      App 未装时降级 wa.me 网页版 ----
     if (typeLower === "whatsapp" || detected === "WhatsApp") {
       const digits = clean.replace(/[^\d]/g, "");
       if (!digits) { api.toast("无法识别 WhatsApp 号码", "error"); return; }
       copyText(clean);
-      openExtURL(`https://wa.me/${digits}`);
-      api.toast("正在打开 WhatsApp…", "success");
+      openAppScheme(
+        `whatsapp://send?phone=${digits}`,
+        () => openExtURL(`https://wa.me/${digits}`),
+        "正在打开 WhatsApp…");
       return;
     }
     // ---- Phone → tel: 跳转拨号盘 ----
     if (detected === "Phone" || typeLower === "phone") {
       const tel = clean.replace(/[^\d+]/g, "");
       if (!tel) { api.toast("无法识别电话号码", "error"); return; }
-      openScheme(`tel:${tel}`, "正在打开拨号…");
+      openAppScheme(
+        `tel:${tel}`,
+        () => { copyText(tel); api.toast("号码已复制，请手动拨打", "success"); },
+        "正在打开拨号…");
       return;
     }
-    // ---- 社媒平台：打开 https 链接，系统自动路由到已安装的 App ----
+    // ---- 社媒平台：App 协议优先（standalone 可靠），失败降级网页链接 ----
     if (typeLower === "linkedin" || /^linkedin/i.test(detected)) {
-      if (/linkedin\.com/i.test(clean)) openExtURL(ensureURL(clean));
-      else openExtURL("https://www.linkedin.com/search/results/all/?keywords=" + encodeURIComponent(clean));
-      api.toast("正在打开 LinkedIn…", "success");
+      const inMatch = clean.match(/linkedin\.com\/in\/([^\/\s?#]+)/i);
+      if (inMatch) {
+        openAppScheme(
+          `linkedin://profile/${inMatch[1]}`,
+          () => openExtURL(ensureURL(clean)),
+          "正在打开 LinkedIn…");
+      } else {
+        const url = /linkedin\.com/i.test(clean) ? ensureURL(clean)
+          : "https://www.linkedin.com/search/results/all/?keywords=" + encodeURIComponent(clean);
+        openExtURL(url);
+        api.toast("正在打开 LinkedIn…", "success");
+      }
       return;
     }
     if (typeLower === "facebook") {
-      if (/facebook\.com|fb\.com/i.test(clean)) openExtURL(ensureURL(clean));
-      else openExtURL("https://www.facebook.com/search/top?q=" + encodeURIComponent(clean));
-      api.toast("正在打开 Facebook…", "success");
+      if (/facebook\.com|fb\.com/i.test(clean)) {
+        const u = ensureURL(clean);
+        openAppScheme(
+          "fb://facewebmodal/f?href=" + encodeURIComponent(u),
+          () => openExtURL(u),
+          "正在打开 Facebook…");
+      } else {
+        openExtURL("https://www.facebook.com/search/top?q=" + encodeURIComponent(clean));
+        api.toast("正在打开 Facebook…", "success");
+      }
       return;
     }
     if (typeLower === "instagram") {
       const handle = clean.replace(/^@/, "").replace(/https?:\/\/(www\.)?instagram\.com\//i, "").replace(/\/$/, "");
-      if (handle) { openExtURL("https://www.instagram.com/" + encodeURIComponent(handle) + "/"); api.toast("正在打开 Instagram…", "success"); }
+      if (handle) openAppScheme(
+        `instagram://user?username=${encodeURIComponent(handle)}`,
+        () => openExtURL("https://www.instagram.com/" + encodeURIComponent(handle) + "/"),
+        "正在打开 Instagram…");
       return;
     }
     if (typeLower === "twitter") {
       const handle = clean.replace(/^@/, "").replace(/https?:\/\/(www\.)?(twitter|x)\.com\//i, "").replace(/\/$/, "");
-      if (handle) { openExtURL("https://x.com/" + encodeURIComponent(handle)); api.toast("正在打开 X / Twitter…", "success"); }
+      if (handle) openAppScheme(
+        `twitter://user?screen_name=${encodeURIComponent(handle)}`,
+        () => openExtURL("https://x.com/" + encodeURIComponent(handle)),
+        "正在打开 X / Twitter…");
       return;
     }
     if (typeLower === "tiktok") {
